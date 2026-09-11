@@ -1,0 +1,67 @@
+{
+  "policies": {
+    "ExtensionSettings": {
+      "*": {
+        "installation_mode": "blocked",
+        "blocked_install_message": "Extensions in this sandbox are fixed by the image."
+      },
+      "uBlock0@raymondhill.net": {
+        "installation_mode": "force_installed",
+        "install_url": "file:///opt/extensions/ublock_origin.xpi",
+        "updates_disabled": true,
+        "default_area": "navbar"
+      }
+    },
+
+    "Proxy": {
+      "Mode": "manual",
+      "HTTPProxy": "172.28.0.2:3128",
+      "SSLProxy": "172.28.0.2:3128",
+      "UseHTTPProxyForAllProtocols": true,
+      "UseProxyForDNS": true,
+      "Locked": true
+    },
+    "DNSOverHTTPS": { "Enabled": false, "Locked": true },
+
+    "Permissions": {
+      "Camera":        { "BlockNewRequests": true, "Locked": true },
+      "Microphone":    { "BlockNewRequests": true, "Locked": true },
+      "Location":      { "BlockNewRequests": true, "Locked": true },
+      "Notifications": { "BlockNewRequests": true, "Locked": true }
+    },
+    "PopupBlocking": { "Default": true, "Locked": true },
+
+    "EnableTrackingProtection": {
+      "Value": true,
+      "Cryptomining": true,
+      "Fingerprinting": true,
+      "Locked": true
+    },
+
+    "OfferToSaveLogins": false,
+    "PasswordManagerEnabled": false,
+    "DisableFormHistory": true,
+    "DisableFirefoxAccounts": true,
+    "DisableTelemetry": true,
+    "DisableFirefoxStudies": true,
+    "DisablePocket": true,
+    "DisableAppUpdate": true,
+    "DisableProfileImport": true,
+    "DontCheckDefaultBrowser": true,
+    "OverrideFirstRunPage": "",
+    "OverridePostUpdatePage": "",
+
+    "Preferences": {
+      "browser.download.folderList":    { "Value": 2, "Status": "locked" },
+      "browser.download.dir":           { "Value": "/nonexistent", "Status": "locked" },
+      "browser.download.useDownloadDir": { "Value": true, "Status": "locked" },
+
+      "extensions.formautofill.addresses.enabled":   { "Value": false, "Status": "locked" },
+      "extensions.formautofill.creditCards.enabled": { "Value": false, "Status": "locked" },
+
+      "browser.safebrowsing.malware.enabled":   { "Value": true, "Status": "locked" },
+      "browser.safebrowsing.phishing.enabled":  { "Value": true, "Status": "locked" },
+      "browser.safebrowsing.downloads.enabled": { "Value": true, "Status": "locked" }
+    }
+  }
+}
