@@ -1,0 +1,7 @@
+# Generated at first run and contains the remote-desktop password.
+.env
+
+# sed leftovers and local scratch
+*.bak
+_to_delete/
+policies/safebrowse.json.chromium-unused

@@ -1,0 +1,5 @@
+# Image digests pinned on 2026-09-11T16:10:26Z
+# Regenerate with ./pin.sh after `docker compose pull`.
+lscr.io/linuxserver/firefox@sha256:bc5b08fa66d505e5a600d474365e57e2d858bcf12d4e80e7c79a3d3dc3b7ca66
+ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029
+alpine/socat@sha256:ef6c281978dcd6927d9b3829484e4c4fdfc5d98de5acbd6312c04565d2d58cbf

@@ -1,0 +1,6 @@
+# One domain per line. A leading dot matches subdomains.
+# Belt-and-braces on top of the filtering resolver - add anything you
+# specifically never want this sandbox to reach.
+.doubleclick.net
+.googlesyndication.com
+.acscdn.com
