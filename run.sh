@@ -11,6 +11,30 @@ step() { printf '%s==>%s %s\n' "$CYN" "$OFF" "$1"; }
 warn() { printf '%sWARNING%s %s\n' "$YLW" "$OFF" "$1"; }
 die()  { printf '\n%sERROR%s  %s\n\n' "$RED" "$OFF" "$1" >&2; exit 1; }
 
+usage() {
+  cat <<'HELP'
+Usage: ./run.sh [--fresh | --resume] [--url https://example.com/]
+  No session exists: build and start a new disposable session.
+  --fresh   Build, then destroy any existing session and start with an empty profile.
+  --resume  Verify and use the existing running session; do not rebuild or restart it.
+  --url     Open one HTTP(S) URL inside Firefox after all automated checks pass.
+  --help    Show this help without contacting Docker.
+HELP
+}
+mode=; target_url=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --fresh|--resume)
+      [ -z "$mode" ] || die "choose --fresh or --resume once."
+      mode=$1; shift ;;
+    --url)
+      [ "$#" -ge 2 ] && [ -n "$2" ] && [ -z "$target_url" ] || die "--url requires one URL and may appear only once."
+      target_url=$2; shift 2 ;;
+    --help|-h) usage; exit 0 ;;
+    *) usage >&2; die "unknown argument; see usage above." ;;
+  esac
+done
+
 # --------------------------------------------------------------------------
 # Preflight - fail with a sentence you can act on, not a stack trace
 # --------------------------------------------------------------------------
@@ -19,6 +43,9 @@ for tool in docker curl python3; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool is required. Install it and retry."
 done
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' || die "Python 3.9+ is required."
+if [ -n "$target_url" ]; then
+  python3 scripts/open_url.py --validate "$target_url" || die "invalid --url; session unchanged."
+fi
 step "Checking Docker"
 command -v docker >/dev/null 2>&1 \
   || die "docker is not on your PATH. Install Docker Desktop, then open a new terminal."
@@ -34,9 +61,9 @@ engine_major=${engine_version%%.*}
 
 # A pre-upgrade bridge cannot be changed in place. Never tear down a session
 # automatically just to migrate its network configuration.
-if mode=$(docker network inspect safebrowse_sandbox \
+if bridge_mode=$(docker network inspect safebrowse_sandbox \
   -f '{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}' 2>/dev/null); then
-  [ "$mode" = isolated ] || die "existing sandbox bridge needs migration: ./stop.sh discards the current session, then rerun ./run.sh."
+  [ "$bridge_mode" = isolated ] || [ "$mode" = --fresh ] || die "existing sandbox bridge needs migration: ./stop.sh discards the current session, then rerun ./run.sh."
 fi
 
 mem=$(docker info --format '{{.MemTotal}}' 2>/dev/null) || mem=0
@@ -52,6 +79,7 @@ fi
 ENV_FILE=".env"
 [ ! -L "$ENV_FILE" ] || die ".env must be a regular file, not a symlink."
 if [ ! -f "$ENV_FILE" ]; then
+  [ "$mode" != --resume ] || die "cannot resume without the original .env credentials."
   step "First run: generating $ENV_FILE with a random UI password"
   if command -v openssl >/dev/null 2>&1; then
     PW=$(openssl rand -hex 12)
@@ -68,14 +96,30 @@ load_credentials "$ENV_FILE" || die ".env must contain unquoted SANDBOX_USER and
 # --------------------------------------------------------------------------
 # Build and start
 # --------------------------------------------------------------------------
-step "Building image (first build pulls ~1.5 GB and takes a few minutes)"
-docker compose build \
-  || die "build failed - the reason is in the output above. Most often: no network, a registry blocking the pull, or Docker out of disk (Settings > Resources)."
-
-step "Starting containers"
-if ! docker compose up -d; then
-  docker compose logs --tail 40
-  die "containers failed to start (logs above)."
+existing=$(docker compose ps --all --quiet) || die "could not inspect existing session."
+if [ -n "$existing" ] && [ -z "$mode" ]; then
+  die "a session already exists. Use --resume to keep it or --fresh to discard its profile."
+fi
+if [ "$mode" = --resume ]; then
+  [ -n "$existing" ] || die "no session exists to resume. Run ./run.sh to create one."
+  # Never let Compose recreate an existing profile while claiming to resume it.
+  running=$(docker inspect --format '{{.State.Running}}' safebrowse safebrowse-gw safebrowse-ui) \
+    || die "session is incomplete; use --fresh to replace it."
+  [ "$running" = $'true\ntrue\ntrue' ] || die "session is not running; use --fresh to create a new profile."
+  step "Resuming the existing profile and tabs"
+else
+  step "Building image (first build pulls ~1.5 GB and takes a few minutes)"
+  docker compose build \
+    || die "build failed; existing session was not discarded. Check the output above."
+  if [ "$mode" = --fresh ]; then
+    step "Discarding the previous session and its profile"
+    docker compose down --volumes --remove-orphans || die "could not discard the previous session."
+  fi
+  step "Starting a fresh session"
+  if ! docker compose up -d; then
+    docker compose logs --tail 40
+    die "containers failed to start (logs above)."
+  fi
 fi
 
 step "Waiting for the remote desktop (up to 3 minutes)"
@@ -92,20 +136,31 @@ if [ "$ready" -ne 1 ]; then
   die "not ready in time. Check Firefox startup, UI authentication and the Troubleshooting section of README.md."
 fi
 
-step "Checking the egress gateway"
-docker exec --user 1000:1000 safebrowse curl --disable --silent --show-error --fail \
-  --max-time 15 --noproxy '' --proxy http://172.28.0.2:3128 https://example.com/ -o /dev/null \
-  || die "desktop is up but gateway access failed. Run ./logs.sh; use ./stop.sh to tear down."
+step "Desktop running; checking containment and browser controls"
+# A blank tab creates content processes without visiting the requested site.
+python3 scripts/open_url.py --initialize || die "desktop is running but Firefox could not initialize; requested URL was not opened."
+./verify.sh --wait-browser
+verification=$?
+case "$verification" in
+  0) step "All automated checks passed" ;;
+  2) printf '\nVerification incomplete; requested URL was not opened. Run ./verify.sh or ./stop.sh.\n' >&2; exit 2 ;;
+  *) die "verification failed; requested URL was not opened. Run ./verify.sh or ./stop.sh." ;;
+esac
+if [ -n "$target_url" ]; then
+  python3 scripts/open_url.py "$target_url" || die "checks passed, but Firefox could not open the requested URL."
+  step "Requested URL sent to Firefox"
+fi
 
 cat <<INFO
 
-  ${GRN}safebrowse is running.${OFF}
+  ${GRN}safebrowse is running; automated checks passed.${OFF}
 
     URL       https://127.0.0.1:3011/     (self-signed cert - accept the warning)
     user      ${SANDBOX_USER}
     password  ${SANDBOX_PASSWORD}
 
-  Next:  ./verify.sh     confirm the hardening actually applied
-         ./stop.sh       destroy everything
+  Next:  ./run.sh --resume --url https://example.com/   keep this session
+         ./run.sh --fresh                               discard it and start fresh
+         ./stop.sh                                     destroy the session
 
 INFO

@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Read-only checks of the running sandbox. Requires Python 3.9+ on the host."""
+import argparse
+import contextlib
+import io
 import json
 from pathlib import Path
 import re
 import subprocess
 import sys
+import time
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parent.parent
 BROWSER = "safebrowse"
@@ -13,6 +18,31 @@ NETWORK = "safebrowse_sandbox"
 PROXY = "http://172.28.0.2:3128"
 UBO = "uBlock0@raymondhill.net"
 CAPS = {"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID", "KILL"}
+
+
+DENIED_URLS = ("http://192.168.1.1/", "http://10.0.0.1/", "http://172.16.0.1/",
+               "http://169.254.169.254/", "http://127.0.0.1/", "http://0.0.0.0/",
+               "http://100.64.0.1/", "http://[::1]/", "http://[fc00::1]/",
+               "http://host.docker.internal/", "http://doubleclick.net/", "http://localtest.me/",
+               "http://example.com:8080/")
+
+
+class Runtime(NamedTuple):
+    """Explicit fixture settings for integration tests; CLI uses production defaults."""
+    browser: str = BROWSER
+    gateway: str = GATEWAY
+    ui: str = "safebrowse-ui"
+    network: str = NETWORK
+    proxy: str = PROXY
+    ui_port: str = "3011"
+    policy_path: Path = ROOT / "policies/firefox-policies.json"
+    allowed_url: str = "https://example.com/"
+    denied_urls: tuple = DENIED_URLS
+    direct_host: str = "1.1.1.1"
+    direct_port: int = 443
+
+
+DEFAULT = Runtime()
 
 
 def run(*args, input=None, timeout=30):
@@ -26,9 +56,9 @@ def docker_json(*args):
     return json.loads(result.stdout)
 
 
-def execute(*args, input=None):
+def execute(*args, input=None, config=DEFAULT):
     # Match Firefox's unprivileged UID, rather than probing as container root.
-    return run("docker", "exec", "-i", "--user", "1000:1000", BROWSER,
+    return run("docker", "exec", "-i", "--user", "1000:1000", config.browser,
                *args, input=input)
 
 
@@ -51,7 +81,7 @@ class Report:
         return 2 if self.counts["INCONCLUSIVE"] else 0
 
 
-def check_isolation(report, browser, ui, network):
+def check_isolation(report, browser, ui, network, config=DEFAULT):
     host = browser["HostConfig"]
     report.check(not any(m.get("Type") in ("bind", "volume") for m in browser["Mounts"]),
                  "browser has no bind mounts or persistent volumes")
@@ -62,7 +92,7 @@ def check_isolation(report, browser, ui, network):
     report.check("ALL" in (host.get("CapDrop") or []) and added <= CAPS and not host.get("Privileged"),
                  "capabilities are within the startup allowlist; container is not privileged")
     report.check(not host.get("PortBindings"), "browser publishes no ports")
-    report.check(set(browser["NetworkSettings"]["Networks"]) == {NETWORK},
+    report.check(set(browser["NetworkSettings"]["Networks"]) == {config.network},
                  "browser belongs only to the expected sandbox network")
     report.check(network.get("Internal") is True and network.get("Driver") == "bridge",
                  "sandbox bridge is internal")
@@ -70,8 +100,8 @@ def check_isolation(report, browser, ui, network):
                  and not network.get("EnableIPv6"),
                  "sandbox bridge has isolated IPv4 gateway mode and IPv6 is disabled")
     bindings = ui["HostConfig"].get("PortBindings") or {}
-    report.check(bindings == {"3001/tcp": [{"HostIp": "127.0.0.1", "HostPort": "3011"}]},
-                 "desktop is published only on 127.0.0.1:3011")
+    report.check(bindings == {"3001/tcp": [{"HostIp": "127.0.0.1", "HostPort": config.ui_port}]},
+                 f"desktop is published only on 127.0.0.1:{config.ui_port}")
     tmpfs = host.get("Tmpfs") or {}
     # Docker supports both HostConfig.Tmpfs and Mounts Type=tmpfs.
     report.check("/config" in tmpfs or any(m.get("Type") == "tmpfs" and m.get("Destination") == "/config"
@@ -93,24 +123,24 @@ def classify_denial(code, returncode, headers=""):
     return "INCONCLUSIVE"
 
 
-def check_proxy(report, url, denied=True):
+def check_proxy(report, url, denied=True, config=DEFAULT):
     result = execute("curl", "--disable", "--silent", "--show-error", "--max-time", "10",
-                     "--noproxy", "", "--proxy", PROXY, "--output", "/dev/null",
-                     "--dump-header", "-", "--write-out", "\n%{http_code}", url)
+                     "--noproxy", "", "--proxy", config.proxy, "--output", "/dev/null",
+                     "--dump-header", "-", "--write-out", "\n%{http_code}", url, config=config)
     headers, _, code = result.stdout.strip().rpartition("\n")
     if denied:
         state = classify_denial(code, result.returncode, headers)
     else:
         state = "PASS" if result.returncode == 0 and re.fullmatch(r"2\d\d", code) else "FAIL"
-    report.emit(state, f"{'proxy denial' if denied else 'proxy internet access'}: {url} "
+    report.emit(state, f"{'proxy denial' if denied else 'proxy web access'}: {url} "
                 f"(HTTP {code or 'missing'}, curl exit {result.returncode})")
 
 
-DIRECT_PROBE = '''import errno, json, socket
+DIRECT_PROBE = '''import json, socket, sys
 s = socket.socket()
 s.settimeout(5)
 try:
-    s.connect(("1.1.1.1", 443))
+    s.connect((sys.argv[1], int(sys.argv[2])))
 except OSError as e:
     print(json.dumps({"connected": False, "errno": e.errno}))
 else:
@@ -120,8 +150,8 @@ finally:
 '''
 
 
-def check_direct(report):
-    result = execute("python3", "-c", DIRECT_PROBE)
+def check_direct(report, config=DEFAULT):
+    result = execute("python3", "-c", DIRECT_PROBE, config.direct_host, str(config.direct_port), config=config)
     if result.returncode:
         report.emit("INCONCLUSIVE", "direct TCP probe could not execute")
         return
@@ -166,22 +196,22 @@ print(json.dumps(processes))
 '''
 
 
-def check_browser(report):
-    ns = execute("unshare", "-Ur", "true")
+def check_browser(report, config=DEFAULT):
+    ns = execute("unshare", "-Ur", "true", config=config)
     report.emit("PASS" if ns.returncode == 0 else "INCONCLUSIVE",
                 "user namespace creation as Firefox UID " + ("succeeded" if ns.returncode == 0 else "failed"))
-    process = execute("python3", "-c", SANDBOX_PROBE)
+    process = execute("python3", "-c", SANDBOX_PROBE, config=config)
     records = json.loads(process.stdout) if process.returncode == 0 else []
     if not records:
         report.emit("INCONCLUSIVE", "no readable Firefox content processes; open a page and rerun")
     else:
         report.check(all(p["seccomp"] == 2 and p["nnp"] == 1 for p in records),
                      "observed Firefox content processes have seccomp filters and no-new-privileges")
-    policy = execute("cat", "/etc/firefox/policies/policies.json")
-    expected = json.loads((ROOT / "policies/firefox-policies.json").read_text())
+    policy = execute("cat", "/etc/firefox/policies/policies.json", config=config)
+    expected = json.loads(config.policy_path.read_text())
     report.check(policy.returncode == 0 and json.loads(policy.stdout) == expected,
                  "deployed policy JSON matches repository (check about:policies for application/errors)")
-    result = execute("python3", "-c", PROFILE_PROBE)
+    result = execute("python3", "-c", PROFILE_PROBE, config=config)
     addons = json.loads(result.stdout) if result.returncode == 0 else []
     if not addons:
         report.emit("INCONCLUSIVE", "no readable live uBlock registration; open a page and rerun")
@@ -217,28 +247,40 @@ def check_pins(report):
                  "PINS.txt agrees with all image references")
 
 
-def main():
+def check_browser_ready(report, config=DEFAULT, wait_seconds=0):
+    """Allow initial profile registration to settle, without hiding final failures."""
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        attempt = Report()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            check_browser(attempt, config)
+        if attempt.counts["FAIL"] or not attempt.counts["INCONCLUSIVE"] or time.monotonic() >= deadline:
+            print(output.getvalue(), end="")
+            for state, count in attempt.counts.items():
+                report.counts[state] += count
+            return
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+
+def main(config=DEFAULT, wait_browser=0):
     report = Report()
     try:
-        browser, gateway, ui = docker_json("inspect", BROWSER, GATEWAY, "safebrowse-ui")
+        browser, gateway, ui = docker_json("inspect", config.browser, config.gateway, config.ui)
         if not all(c.get("State", {}).get("Running") for c in (browser, gateway, ui)):
             report.emit("FAIL", "all three containers must be running; run ./run.sh first")
             return report.finish()
-        network = docker_json("network", "inspect", NETWORK)[0]
-        check_isolation(report, browser, ui, network)
+        network = docker_json("network", "inspect", config.network)[0]
+        check_isolation(report, browser, ui, network, config)
         report.check(gateway["HostConfig"].get("LogConfig", {}).get("Type") == "none"
                      and "/var/log/squid" in (gateway["HostConfig"].get("Tmpfs") or {}),
                      "gateway diagnostics are on tmpfs and Docker log storage is disabled")
-        check_direct(report)
-        check_proxy(report, "https://example.com/", denied=False)
-        for url in ("http://192.168.1.1/", "http://10.0.0.1/", "http://172.16.0.1/",
-                    "http://169.254.169.254/", "http://127.0.0.1/", "http://0.0.0.0/",
-                    "http://100.64.0.1/", "http://[::1]/", "http://[fc00::1]/",
-                    "http://host.docker.internal/", "http://doubleclick.net/", "http://localtest.me/",
-                    "http://example.com:8080/"):
-            check_proxy(report, url)
-        check_browser(report)
-        logs = run("docker", "logs", "--since", browser["State"]["StartedAt"], BROWSER)
+        check_direct(report, config)
+        check_proxy(report, config.allowed_url, denied=False, config=config)
+        for url in config.denied_urls:
+            check_proxy(report, url, config=config)
+        check_browser_ready(report, config, wait_browser)
+        logs = run("docker", "logs", "--since", browser["State"]["StartedAt"], config.browser)
         report.emit(clipboard_state(logs.stdout + logs.stderr) if logs.returncode == 0 else "INCONCLUSIVE",
                     "both clipboard directions explicitly disabled in current-start logs")
         print("  LIMITATION  sidebar file transfer remains available; hidden controls are not enforcement")
@@ -250,4 +292,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--wait-browser", action="store_true", help="allow up to 30 seconds for Firefox profile initialization")
+    args = parser.parse_args()
+    sys.exit(main(wait_browser=30 if args.wait_browser else 0))

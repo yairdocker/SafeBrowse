@@ -22,13 +22,35 @@ internal bridge on an older engine.
 ```bash
 git clone https://github.com/yairdocker/SafeBrowse.git
 cd SafeBrowse
-./run.sh        # builds, generates a random UI password, starts, prints the URL
-./verify.sh     # checks runtime controls; exit 1 = failure, 2 = inconclusive
+./run.sh --fresh --url https://example.com/  # new profile; verify before opening the site
 ```
 
-For an existing installation, run `./stop.sh` once before upgrading so Compose
-can recreate the sandbox bridge with isolated gateway mode. This discards the
-current session. The launcher refuses an existing bridge with the old mode.
+Choose the session lifecycle explicitly:
+
+```bash
+./run.sh                               # first launch, only if no session exists
+./run.sh --resume --url https://example.com/  # keep current profile and tabs
+./run.sh --fresh                        # build, discard old session, start empty
+```
+
+If a session already exists, a plain `./run.sh` refuses to replace or reuse it.
+`--resume` requires all session containers to be running and never rebuilds or
+restarts them. `--fresh` builds before discarding the old session, so a failed
+build preserves it. Once teardown begins, startup failures cannot restore the
+old profile. The login credentials in `.env` remain the same across sessions.
+`--fresh` also recreates an older sandbox bridge with isolated gateway mode.
+
+The launcher waits for authenticated desktop readiness, opens a blank tab, and
+runs all automated verification checks. The requested URL is sent to Firefox
+only after they all pass. A failed check exits **1**; incomplete verification
+exits **2**. The containers remain available for diagnosis using `./verify.sh`
+and can be removed with `./stop.sh`. This gate does not prevent someone from
+manually using the running desktop before verification finishes.
+
+`--url` accepts one absolute HTTP(S) URL without embedded credentials, whitespace
+or backslashes. Quote URLs containing shell metacharacters. URLs are passed as
+separate arguments to Firefox, never interpolated into shell code or
+`FIREFOX_CLI`.
 
 First build pulls roughly 1.5 GB. Open the printed URL, accept the self-signed
 certificate warning, log in with the generated credentials, and browse.
@@ -142,8 +164,8 @@ fetch upstream updates:
 
 ```bash
 ./pin.sh --refresh   # pull all three upstream tags, resolve, then rewrite pins
-./run.sh            # rebuild and start; this can replace the current session
-./verify.sh         # open a page first; resolve failures/inconclusive checks
+./run.sh --fresh    # rebuild, discard old session, start and verify
+./verify.sh         # rerun checks at any time
 ```
 
 Do not use `docker compose pull` to refresh pins: it pulls the references already
@@ -169,7 +191,7 @@ UI binding, mounts, capability allowlist and resource limits, and attempts direc
 TCP and proxied requests. It runs browser probes as UID 1000. It also compares the
 deployed policy JSON, checks active uBlock profile registration, attempts a user
 namespace, and examines observed Firefox content-process seccomp/no-new-privileges
-flags. These are bounded checks, not a full security certification.
+flags. Startup allows up to 30 seconds for initial Firefox profile registration. These are bounded checks, not a full security certification.
 
 - Exit **0**: all automated checks passed.
 - Exit **1**: at least one verified check failed.
@@ -195,6 +217,33 @@ Run offline regression tests with:
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+Run the real-container suite with Docker running (also needs OpenSSL):
+
+```bash
+python3 tests/integration.py
+```
+
+It builds the pinned Firefox image and derives an isolated fixture from the
+production Compose configuration. Unique container/network names, unused
+subnets and a temporary localhost desktop port keep it separate from an existing
+session. It changes only fixture addressing, policy proxy addresses and test
+service wiring; it runs the same verifier with explicit fixture settings.
+Local HTTP/TLS servers and a local Squid hosts file make request outcomes
+independent of public websites and DNS. Building/pulling images still needs
+network access on a cold machine.
+
+The suite checks authentication, runtime containment, active uBlock registration,
+HTTP and certificate-verified HTTPS CONNECT, live private-IP/hostname denial,
+restricted ports, actual Firefox navigation, failure with a stopped gateway,
+and profile disposal after teardown/recreation. It removes its own containers,
+networks and image in a `finally` block. Build caches may remain; a hard kill or
+Docker daemon failure can prevent cleanup. It does not verify the desktop UI's
+clipboard behavior or prove that every uBlock filter is effective.
+
+GitHub Actions runs both offline tests and this integration suite on Ubuntu.
+A newly added workflow is not evidence of a passing Linux run; inspect its
+result before treating that platform as verified.
 
 ---
 
@@ -269,10 +318,12 @@ docker-compose.yml              topology, isolation, tmpfs, caps, limits
 policies/firefox-policies.json  Firefox enterprise policy
 gateway/squid.conf              egress rules: no private space, no odd ports
 gateway/blocklist.txt           extra domains to refuse
-run.sh / stop.sh                launch and destroy
+run.sh / stop.sh                explicit new/resume/fresh lifecycle and teardown
+scripts/open_url.py            validated URL dispatch to the running Firefox
 pin.sh / scripts/pin.py         pin cached images; --refresh pulls updates
 verify.sh / scripts/verify.py   structured runtime checks and live egress tests
-tests/test_security.py         offline regression tests
+tests/test_*.py                offline security and launcher regressions
+tests/integration.py            real stack against disposable local fixtures
 .dockerignore                  allowlist of build inputs; excludes .env and .git
 logs.sh                         gateway startup, cache and access logs
 ```
