@@ -93,6 +93,28 @@ class VerificationTests(unittest.TestCase):
             self.assertEqual(verify.main(), 2)
         self.assertNotIn("PASS", self.output.getvalue())
 
+    def test_startup_retry_reports_only_final_browser_result(self):
+        def probe(report, config):
+            report.emit("INCONCLUSIVE" if probe.calls == 0 else "PASS", "profile initialization")
+            probe.calls += 1
+        probe.calls = 0
+        with patch.object(verify, "check_browser", side_effect=probe), patch.object(verify.time, "sleep"):
+            verify.check_browser_ready(self.report, wait_seconds=30)
+        self.assertEqual(probe.calls, 2)
+        self.assertEqual(self.report.counts, {"PASS": 1, "FAIL": 0, "INCONCLUSIVE": 0})
+
+    def test_startup_retry_never_hides_a_verified_failure(self):
+        with patch.object(verify, "check_browser", side_effect=lambda report, config: report.emit("FAIL", "disabled blocker")) as probe:
+            verify.check_browser_ready(self.report, wait_seconds=30)
+        self.assertEqual(probe.call_count, 1)
+        self.assertEqual(self.report.finish(), 1)
+
+    def test_startup_timeout_remains_inconclusive(self):
+        with patch.object(verify, "check_browser", side_effect=lambda report, config: report.emit("INCONCLUSIVE", "missing profile")):
+            verify.check_browser_ready(self.report, wait_seconds=0)
+        self.assertEqual(self.report.counts["PASS"], 0)
+        self.assertEqual(self.report.finish(), 2)
+
     def test_namespace_and_missing_addon_probes_do_not_pass(self):
         policy = (ROOT / "policies/firefox-policies.json").read_text()
         responses = [result("", 125), result("[]"), result(policy), result("[]")]
