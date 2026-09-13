@@ -12,12 +12,14 @@
 # ---------------------------------------------------------------------------
 FROM lscr.io/linuxserver/firefox@sha256:bc5b08fa66d505e5a600d474365e57e2d858bcf12d4e80e7c79a3d3dc3b7ca66
 
-ARG UBO_XPI_URL=https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi
+ARG UBO_XPI_URL=https://addons.mozilla.org/firefox/downloads/file/4981431/ublock_origin-1.74.0.xpi
+ARG UBO_XPI_SHA256=175756d74468c9ba45863f7fc333d3be670f82d5b066314e915814dd547d1652
 
 USER root
 
 # ---- uBlock Origin, baked into the image so startup needs no network -------
-# The build asserts the download really is a Firefox add-on. If Mozilla ever
+# Verify the versioned artifact hash before inspecting or installing it.
+# The build also asserts the download really is a Firefox add-on. If Mozilla ever
 # moves the URL, this fails loudly at build time rather than producing an
 # image whose blocker silently never loads - which is exactly how the
 # Chromium version of this failed three times.
@@ -26,6 +28,7 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends curl ca-certificates unzip; \
     mkdir -p /opt/extensions; \
     curl -fsSL "${UBO_XPI_URL}" -o /opt/extensions/ublock_origin.xpi; \
+    printf '%s  /opt/extensions/ublock_origin.xpi\n' "${UBO_XPI_SHA256}" | sha256sum -c -; \
     unzip -p /opt/extensions/ublock_origin.xpi manifest.json > /tmp/m.json; \
     grep -q 'uBlock0@raymondhill.net' /tmp/m.json; \
     rm -f /tmp/m.json; \
