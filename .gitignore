@@ -5,3 +5,8 @@
 *.bak
 _to_delete/
 policies/safebrowse.json.chromium-unused
+
+# Python verification/test caches
+__pycache__/
+*.pyc
+.pin-*

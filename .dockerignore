@@ -1,0 +1,5 @@
+# Only build inputs belong in the Docker context; never send .env or .git.
+**
+!Dockerfile
+!policies/
+!policies/firefox-policies.json

@@ -1,13 +1,13 @@
 # ---------------------------------------------------------------------------
-# safebrowse - disposable hardened Chromium with filtered egress.
+# safebrowse - disposable hardened Firefox with filtered egress.
 #
-#   host :3011 ──► uiproxy ──(internal)──► safebrowse (Chromium)
+#   host :3011 ──► uiproxy ──(internal)──► safebrowse (Firefox)
 #                                              │
 #                                              └──► gateway (Squid) ──► internet
 #
 # The browser sits on an internal-only Docker network. It has no default
-# route, no DNS of its own, and no published ports. Its single path to the
-# outside world is the Squid gateway, which refuses private address space,
+# route and no published ports. Docker DNS still resolves container names.
+# Its configured web path to the outside world is the Squid gateway, which refuses private address space,
 # non-web ports, and anything on the blocklist.
 # ---------------------------------------------------------------------------
 
@@ -18,6 +18,9 @@ services:
     image: ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029
     container_name: safebrowse-gw
     hostname: gateway
+    # The upstream entrypoint tails files to stdout; disable that disk copy.
+    logging:
+      driver: none
     volumes:
       - ./gateway/squid.conf:/etc/squid/squid.conf:ro
       - ./gateway/blocklist.txt:/etc/squid/blocklist.txt:ro
@@ -25,6 +28,8 @@ services:
       sandbox_net:
         ipv4_address: 172.28.0.2
       egress_net:
+    tmpfs:
+      - /var/log/squid:uid=13,gid=13,mode=0750,size=16m
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -39,8 +44,8 @@ services:
     pids_limit: 256
     restart: "no"
 
-  # --- publishes the remote desktop, because an internal-network container
-  #     cannot publish ports itself. Raw TCP passthrough: TLS stays
+  # --- publishes the remote desktop outside the isolated network.
+  #     Raw TCP passthrough: TLS stays
   #     end-to-end between your Mac and the browser container.
   uiproxy:
     image: alpine/socat@sha256:ef6c281978dcd6927d9b3829484e4c4fdfc5d98de5acbd6312c04565d2d58cbf
@@ -101,7 +106,7 @@ services:
       - SELKIES_MICROPHONE_ENABLED=false
 
     # No dns: key here on purpose. Docker's embedded resolver stays in place
-    # for container names; every external lookup happens at the gateway.
+    # for container names; Firefox web requests delegate DNS to the HTTP proxy.
 
     tmpfs:
       - /config:uid=1000,gid=1000,mode=0700,size=1g
@@ -110,15 +115,9 @@ services:
 
     security_opt:
       - no-new-privileges:true
-      # Required, not optional. Docker's default seccomp profile gates
-      # clone(CLONE_NEWUSER) behind CAP_SYS_ADMIN, and no-new-privileges
-      # neuters the SUID helper - so BOTH of Chromium's sandbox mechanisms are
-      # unavailable and renderers run completely unconfined ("No usable
-      # sandbox!"). Relaxing the outer filter is the cheaper trade: it buys
-      # back Chromium's own per-renderer seccomp-bpf and namespace isolation,
-      # which is the layer that actually contains hostile JavaScript.
-      # The alternative, cap_add: SYS_ADMIN, keeps seccomp but hands the
-      # container the single most escape-prone capability. Worse.
+      # Compatibility exception: the default filter blocks Firefox user
+      # namespaces on the tested host. This removes an outer defense; verify
+      # the live content-process filters and keep Docker's VM/kernel updated.
       - seccomp=unconfined
     cap_drop:
       - ALL
@@ -141,11 +140,14 @@ services:
 networks:
   # internal: true means Docker installs a firewall rule dropping anything
   # entering this bridge from outside its own subnet, and gives members no
-  # NAT to the internet. That is the containment.
+  # NAT to the internet. Isolated gateway mode also removes the bridge host address.
   sandbox_net:
     name: safebrowse_sandbox
     driver: bridge
     internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
     ipam:
       config:
         - subnet: 172.28.0.0/24
