@@ -15,8 +15,8 @@
 
     "Proxy": {
       "Mode": "manual",
-      "HTTPProxy": "172.28.0.2:3128",
-      "SSLProxy": "172.28.0.2:3128",
+      "HTTPProxy": "gateway:3128",
+      "SSLProxy": "gateway:3128",
       "UseHTTPProxyForAllProtocols": true,
       "UseProxyForDNS": true,
       "Locked": true

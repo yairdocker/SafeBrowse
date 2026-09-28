@@ -1,5 +1,6 @@
 # Generated at first run and contains the remote-desktop password.
 .env
+.runtime/
 
 # sed leftovers and local scratch
 *.bak

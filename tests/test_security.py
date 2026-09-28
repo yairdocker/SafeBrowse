@@ -173,10 +173,10 @@ class IsolationTests(unittest.TestCase):
         self.network = {"Internal": True, "Driver": "bridge", "EnableIPv6": False,
                         "Options": {"com.docker.network.bridge.gateway_mode_ipv4": "isolated"}}
 
-    def check(self):
+    def check(self, config=verify.DEFAULT):
         report = verify.Report()
         with contextlib.redirect_stdout(io.StringIO()):
-            verify.check_isolation(report, self.browser, self.ui, self.network)
+            verify.check_isolation(report, self.browser, self.ui, self.network, config)
         return report.counts["FAIL"]
 
     def test_tmpfs_mount_is_allowed(self):
@@ -197,6 +197,10 @@ class IsolationTests(unittest.TestCase):
     def test_internal_bridge_without_isolated_gateway_fails(self):
         self.network["Options"] = {}
         self.assertGreater(self.check(), 0)
+
+    def test_selected_subnet_must_match_live_bridge(self):
+        self.network["IPAM"] = {"Config": [{"Subnet": "172.31.2.0/24"}]}
+        self.assertGreater(self.check(verify.DEFAULT._replace(subnet="172.31.1.0/24")), 0)
 
     def test_lan_ui_binding_is_rejected(self):
         self.ui["HostConfig"]["PortBindings"]["3001/tcp"][0]["HostIp"] = "0.0.0.0"

@@ -22,11 +22,10 @@ services:
     logging:
       driver: none
     volumes:
-      - ./gateway/squid.conf:/etc/squid/squid.conf:ro
+      - ${SQUID_CONFIG_PATH:-./gateway/squid.conf}:/etc/squid/squid.conf:ro
       - ./gateway/blocklist.txt:/etc/squid/blocklist.txt:ro
     networks:
       sandbox_net:
-        ipv4_address: 172.28.0.2
       egress_net:
     tmpfs:
       - /var/log/squid:uid=13,gid=13,mode=0750,size=16m
@@ -150,7 +149,8 @@ networks:
       com.docker.network.bridge.gateway_mode_ipv4: isolated
     ipam:
       config:
-        - subnet: 172.28.0.0/24
+        # run.sh supplies an unused subnet; this fallback supports direct Compose use.
+        - subnet: ${SANDBOX_SUBNET:-172.28.0.0/24}
 
   egress_net:
     name: safebrowse_egress
