@@ -51,6 +51,13 @@ with open(os.environ['ACTION_LOG'], 'a') as f:
 if name == 'python3':
     if '--validate' in args:
         sys.exit(subprocess.run([sys.executable, os.environ['REAL_OPENER']] + args[1:]).returncode)
+    if args[:1] == ['scripts/network.py']:
+        print('172.31.1.0/24' if '--skip' in args else '172.31.0.0/24')
+    if args[:2] == ['scripts/open_url.py', '--initialize'] and os.environ.get('INIT_FAIL_ONCE'):
+        marker = Path('initialize-count')
+        if not marker.exists():
+            marker.write_text('1')
+            sys.exit(1)
     sys.exit(0)
 if name == 'verify.sh':
     sys.exit(int(os.environ.get('VERIFY_EXIT', '0')))
@@ -63,6 +70,12 @@ elif args[:2] == ['compose', 'ps']:
     print('existing' if os.environ.get('EXISTING') else '')
 elif args[:2] == ['compose', 'build']:
     sys.exit(int(os.environ.get('BUILD_EXIT', '0')))
+elif args[:2] == ['compose', 'up'] and os.environ.get('UP_OVERLAP_ONCE'):
+    marker = Path('up-count')
+    if not marker.exists():
+        marker.write_text('1')
+        print('invalid pool request: Pool overlaps with other one on this address space', file=sys.stderr)
+        sys.exit(1)
 elif args[:1] == ['inspect']:
     print('true\ntrue\ntrue')
 elif args[:1] == ['version']:
@@ -87,7 +100,7 @@ class LauncherTests(unittest.TestCase):
                 path.chmod(0o755)
             env = dict(os.environ, PATH=str(root / 'bin') + os.pathsep + os.environ['PATH'],
                        ACTION_LOG=str(root / 'actions'), REAL_OPENER=str(ROOT / 'scripts/open_url.py'))
-            for name in ('EXISTING', 'VERIFY_EXIT', 'BUILD_EXIT'):
+            for name in ('EXISTING', 'VERIFY_EXIT', 'BUILD_EXIT', 'UP_OVERLAP_ONCE', 'INIT_FAIL_ONCE'):
                 env.pop(name, None)
             env.update(settings)
             result = subprocess.run(['bash', str(root / 'run.sh'), *args], env=env, text=True,
@@ -118,6 +131,20 @@ class LauncherTests(unittest.TestCase):
         result, actions = self.launch('--fresh', EXISTING='1', BUILD_EXIT='1')
         self.assertEqual(result.returncode, 1)
         self.assertNotIn(['docker', 'compose', 'down', '--volumes', '--remove-orphans'], actions)
+
+    def test_overlapping_pool_retries_with_another_subnet(self):
+        result, actions = self.launch(UP_OVERLAP_ONCE='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        selections = [a for a in actions if a[:3] == ['python3', 'scripts/network.py', 'select']]
+        self.assertEqual(len(selections), 2)
+        self.assertIn('--skip', selections[1])
+        self.assertEqual(sum(a[:3] == ['docker', 'compose', 'up'] for a in actions), 2)
+        self.assertIn('trying another subnet', result.stdout)
+
+    def test_firefox_startup_race_is_retried(self):
+        result, actions = self.launch(INIT_FAIL_ONCE='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sum(a[:3] == ['python3', 'scripts/open_url.py', '--initialize'] for a in actions), 2)
 
     def test_target_is_opened_only_after_successful_verification(self):
         url = 'https://example.com/?x=$(id);&y=1'

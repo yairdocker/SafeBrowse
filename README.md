@@ -39,6 +39,11 @@ restarts them. `--fresh` builds before discarding the old session, so a failed
 build preserves it. Once teardown begins, startup failures cannot restore the
 old profile. The login credentials in `.env` remain the same across sessions.
 `--fresh` also recreates an older sandbox bridge with isolated gateway mode.
+The launcher selects an unused private `/24` for that bridge, retries a Docker
+pool collision with another subnet, and stores its choice in the ignored
+`.runtime/` directory. `--resume` reuses the selected network; the desktop URL
+stays on `127.0.0.1:3011`. Run `./run.sh` rather than `docker compose up` to get
+automatic subnet selection.
 
 The launcher waits for authenticated desktop readiness, opens a blank tab, and
 runs all automated verification checks. The requested URL is sent to Firefox
@@ -82,7 +87,9 @@ rules blocking ordinary external routing. Isolated IPv4 gateway mode removes
 the bridge's host address, closing the host-service path a plain `internal`
 bridge leaves open. IPv6 is disabled on this bridge. Docker DNS remains present
 for container names. Firefox web requests use the Squid gateway through locked
-enterprise policy; this policy is not a boundary against arbitrary native code.
+enterprise policy. The policy uses Docker's `gateway` service name, while the
+launcher writes a Squid source ACL for the selected bridge subnet. The policy
+is not a boundary against arbitrary native code.
 
 To expose the desktop while keeping Firefox on the isolated network, a `socat`
 container forwards `127.0.0.1:3011` to the browser's remote desktop. It's raw
@@ -227,7 +234,7 @@ python3 tests/integration.py
 It builds the pinned Firefox image and derives an isolated fixture from the
 production Compose configuration. Unique container/network names, unused
 subnets and a temporary localhost desktop port keep it separate from an existing
-session. It changes only fixture addressing, policy proxy addresses and test
+session. It changes only fixture addressing and test
 service wiring; it runs the same verifier with explicit fixture settings.
 Local HTTP/TLS servers and a local Squid hosts file make request outcomes
 independent of public websites and DNS. Building/pulling images still needs
@@ -341,9 +348,13 @@ narrower custom profile needs its own Firefox/runtime testing; do not add
 `SYS_ADMIN` as a shortcut. Keep Docker Desktop and its kernel updated.
 
 **Nothing loads at all.** Check the gateway first: `./logs.sh`. Squid refusing
-everything usually means the sandbox subnet in `squid.conf`
-(`acl sandbox src 172.28.0.0/24`) no longer matches the one in
-`docker-compose.yml`. They must agree.
+everything may mean `.runtime/squid.conf` has an `acl sandbox src` that differs
+from the subnet in `.runtime/network.json` or Docker's `safebrowse_sandbox`
+network. `./run.sh --fresh` regenerates the ACL and network configuration.
+
+**Docker reports an overlapping pool.** The launcher checks existing Docker
+networks and tries up to three unused subnets. A direct `docker compose up`
+uses the fallback `172.28.0.0/24` and can still collide; launch with `./run.sh`.
 
 **A site you need is half-broken.** `./logs.sh` shows memory-backed gateway
 diagnostics. Access logs are off by default. For temporary request diagnostics,

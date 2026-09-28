@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BROWSER = "safebrowse"
 GATEWAY = "safebrowse-gw"
 NETWORK = "safebrowse_sandbox"
-PROXY = "http://172.28.0.2:3128"
+PROXY = "http://gateway:3128"
 UBO = "uBlock0@raymondhill.net"
 CAPS = {"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID", "KILL"}
 
@@ -40,6 +40,7 @@ class Runtime(NamedTuple):
     denied_urls: tuple = DENIED_URLS
     direct_host: str = "1.1.1.1"
     direct_port: int = 443
+    subnet: str = ""
 
 
 DEFAULT = Runtime()
@@ -99,6 +100,9 @@ def check_isolation(report, browser, ui, network, config=DEFAULT):
     report.check(network.get("Options", {}).get("com.docker.network.bridge.gateway_mode_ipv4") == "isolated"
                  and not network.get("EnableIPv6"),
                  "sandbox bridge has isolated IPv4 gateway mode and IPv6 is disabled")
+    if config.subnet:
+        actual = [entry.get("Subnet") for entry in (network.get("IPAM", {}).get("Config") or [])]
+        report.check(actual == [config.subnet], "sandbox bridge uses the selected subnet")
     bindings = ui["HostConfig"].get("PortBindings") or {}
     report.check(bindings == {"3001/tcp": [{"HostIp": "127.0.0.1", "HostPort": config.ui_port}]},
                  f"desktop is published only on 127.0.0.1:{config.ui_port}")
@@ -295,4 +299,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wait-browser", action="store_true", help="allow up to 30 seconds for Firefox profile initialization")
     args = parser.parse_args()
-    sys.exit(main(wait_browser=30 if args.wait_browser else 0))
+    try:
+        from network import STATE, current
+        subnet = str(current()) if STATE.exists() or STATE.is_symlink() else "172.28.0.0/24"
+    except (OSError, ValueError, RuntimeError):
+        print("  INCONCLUSIVE  selected sandbox subnet is unavailable; run ./run.sh first", file=sys.stderr)
+        sys.exit(2)
+    sys.exit(main(DEFAULT._replace(subnet=subnet), wait_browser=30 if args.wait_browser else 0))

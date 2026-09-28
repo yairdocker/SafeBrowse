@@ -79,7 +79,7 @@ secure.serve_forever()
 def main():
     # Keep the test independent of the caller's Compose overrides and credentials.
     env = {k: v for k, v in os.environ.items() if not k.startswith('COMPOSE_')
-           and k not in ('SANDBOX_USER', 'SANDBOX_PASSWORD')}
+           and k not in ('SANDBOX_USER', 'SANDBOX_PASSWORD', 'SANDBOX_SUBNET', 'SQUID_CONFIG_PATH')}
     env.update(SANDBOX_USER='integration', SANDBOX_PASSWORD=secrets.token_hex(24))
     major = int(command('docker', 'version', '--format', '{{.Server.Version}}', env=env).stdout.split('.')[0])
     require(major >= 28, 'Docker Engine supports isolated bridge mode (28+)')
@@ -92,14 +92,16 @@ def main():
     if existing_ids:
         for network in json.loads(command('docker', 'network', 'inspect', *existing_ids, env=env).stdout):
             used += [ipaddress.ip_network(c['Subnet']) for c in (network.get('IPAM', {}).get('Config') or []) if c.get('Subnet')]
-    def unused(prefix):
-        for octet in range(40, 240):
-            net = ipaddress.ip_network(f'{prefix}.{octet}.0/24')
-            if not any(net.overlaps(other) for other in used if other.version == 4):
-                used.append(net)
-                return str(net)
+    def unused(*pools):
+        for pool in map(ipaddress.ip_network, pools):
+            for net in pool.subnets(new_prefix=24):
+                if not any(net.overlaps(other) for other in used if other.version == 4):
+                    used.append(net)
+                    return str(net)
         raise RuntimeError('no unused integration subnet')
-    sandbox_subnet, public_subnet, private_subnet = unused('172.29'), unused('198.18'), unused('10.231')
+    sandbox_subnet = unused('172.31.0.0/16', '172.16.0.0/12')
+    public_subnet = unused('198.18.0.0/15')
+    private_subnet = unused('10.231.0.0/16', '10.0.0.0/8')
     gateway_ip = sandbox_subnet.split('/')[0][:-1] + '2'
     public_ip = public_subnet.split('/')[0][:-1] + '10'
     private_ip = private_subnet.split('/')[0][:-1] + '10'
@@ -116,8 +118,7 @@ def main():
             shutil.copyfile(ROOT / name, fixture / name)
         policy = json.loads((ROOT / 'policies/firefox-policies.json').read_text())
         for key in ('HTTPProxy', 'SSLProxy'):
-            require(policy['policies']['Proxy'][key] == '172.28.0.2:3128', f'fixture recognizes {key}')
-            policy['policies']['Proxy'][key] = gateway_ip + ':3128'
+            require(policy['policies']['Proxy'][key] == 'gateway:3128', f'fixture recognizes {key}')
         policy_path = fixture / 'policies/firefox-policies.json'
         policy_path.write_text(json.dumps(policy))
         squid = replace_once((ROOT / 'gateway/squid.conf').read_text(), 'acl sandbox src 172.28.0.0/24',
@@ -147,7 +148,7 @@ def main():
         browser['image'] = image
         browser['build']['context'] = str(fixture)
         gw = services['gateway']
-        gw['networks']['sandbox_net']['ipv4_address'] = gateway_ip
+        gw['networks']['sandbox_net'] = {'ipv4_address': gateway_ip}
         gw['networks']['fixture_private'] = {}
         for mount in gw['volumes']:
             mount['source'] = str(fixture / 'gateway' / Path(mount['source']).name)
@@ -168,7 +169,8 @@ def main():
         compose = ['docker', 'compose', '-f', str(config_path), '-p', project]
         config = verify.Runtime(browser=browser['container_name'], gateway=gw['container_name'],
                                 ui=services['uiproxy']['container_name'], network=model['networks']['sandbox_net']['name'],
-                                proxy='http://' + gateway_ip + ':3128', ui_port=port, policy_path=policy_path,
+                                proxy='http://gateway:3128', ui_port=port, policy_path=policy_path,
+                                subnet=sandbox_subnet,
                                 allowed_url=f'http://{public_ip}/positive', direct_host=public_ip, direct_port=80,
                                 denied_urls=tuple(u for u in verify.DENIED_URLS if 'example.com:' not in u) +
                                 (f'http://{private_ip}/denied-private', 'http://private.safebrowse.test/denied-hostname',

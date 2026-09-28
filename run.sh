@@ -5,11 +5,18 @@ set -uo pipefail
 cd "$(dirname "$0")" || exit 1
 # shellcheck source=scripts/launch-lib.sh
 . ./scripts/launch-lib.sh
+# Ignore inherited Compose addressing; the launcher owns these values.
+unset SANDBOX_SUBNET SQUID_CONFIG_PATH
 
 RED=$'\033[31m'; GRN=$'\033[32m'; YLW=$'\033[33m'; CYN=$'\033[36m'; OFF=$'\033[0m'
 step() { printf '%s==>%s %s\n' "$CYN" "$OFF" "$1"; }
 warn() { printf '%sWARNING%s %s\n' "$YLW" "$OFF" "$1"; }
 die()  { printf '\n%sERROR%s  %s\n\n' "$RED" "$OFF" "$1" >&2; exit 1; }
+set_network() {
+  SANDBOX_SUBNET=$(python3 scripts/network.py "$@") || die "could not prepare the isolated sandbox network."
+  SQUID_CONFIG_PATH="$(pwd)/.runtime/squid.conf"
+  export SANDBOX_SUBNET SQUID_CONFIG_PATH
+}
 
 usage() {
   cat <<'HELP'
@@ -100,8 +107,18 @@ existing=$(docker compose ps --all --quiet) || die "could not inspect existing s
 if [ -n "$existing" ] && [ -z "$mode" ]; then
   die "a session already exists. Use --resume to keep it or --fresh to discard its profile."
 fi
+# Use the current config for build/down when replacing or cleaning up a session.
+# A missing or damaged state file must not prevent --fresh from recovering it.
+if [ "$mode" != --resume ] && [ -f .runtime/network.json ]; then
+  if saved_subnet=$(python3 scripts/network.py current 2>/dev/null); then
+    SANDBOX_SUBNET=$saved_subnet
+    SQUID_CONFIG_PATH="$(pwd)/.runtime/squid.conf"
+    export SANDBOX_SUBNET SQUID_CONFIG_PATH
+  fi
+fi
 if [ "$mode" = --resume ]; then
   [ -n "$existing" ] || die "no session exists to resume. Run ./run.sh to create one."
+  set_network current
   # Never let Compose recreate an existing profile while claiming to resume it.
   running=$(docker inspect --format '{{.State.Running}}' safebrowse safebrowse-gw safebrowse-ui) \
     || die "session is incomplete; use --fresh to replace it."
@@ -114,12 +131,39 @@ else
   if [ "$mode" = --fresh ]; then
     step "Discarding the previous session and its profile"
     docker compose down --volumes --remove-orphans || die "could not discard the previous session."
+  else
+    # A failed earlier launch may have left Compose networks but no containers.
+    docker compose down --volumes --remove-orphans || die "could not clear partial Compose networks."
   fi
-  step "Starting a fresh session"
-  if ! docker compose up -d; then
-    docker compose logs --tail 40
-    die "containers failed to start (logs above)."
-  fi
+  up_log=$(mktemp) || die "could not create a temporary startup log."
+  trap 'rm -f "$up_log"' EXIT
+  skipped=()
+  started=0
+  for attempt in 1 2 3; do
+    if [ "$attempt" -eq 1 ]; then
+      set_network select
+    else
+      set_network select "${skipped[@]}"
+    fi
+    step "Starting a fresh session on $SANDBOX_SUBNET"
+    if docker compose up -d >"$up_log" 2>&1; then
+      cat "$up_log"
+      started=1
+      break
+    fi
+    cat "$up_log"
+    if [ "$attempt" -lt 3 ] && grep -Eqi 'invalid pool request|pool overlaps' "$up_log"; then
+      warn "Docker rejected $SANDBOX_SUBNET; trying another subnet."
+      docker compose down --volumes --remove-orphans || die "could not clean up the failed network attempt."
+      skipped+=(--skip "$SANDBOX_SUBNET")
+    else
+      docker compose logs --tail 40
+      die "containers failed to start (logs above)."
+    fi
+  done
+  [ "$started" -eq 1 ] || die "Docker rejected every attempted sandbox subnet."
+  rm -f "$up_log"
+  trap - EXIT
 fi
 
 step "Waiting for the remote desktop (up to 3 minutes)"
@@ -138,7 +182,17 @@ fi
 
 step "Desktop running; checking containment and browser controls"
 # A blank tab creates content processes without visiting the requested site.
-python3 scripts/open_url.py --initialize || die "desktop is running but Firefox could not initialize; requested URL was not opened."
+step "Waiting for Firefox (up to 60 seconds)"
+firefox_ready=0
+deadline=$((SECONDS + 60))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  if python3 scripts/open_url.py --initialize >/dev/null 2>&1; then
+    firefox_ready=1
+    break
+  fi
+  sleep 2
+done
+[ "$firefox_ready" -eq 1 ] || die "desktop is running but Firefox could not initialize; requested URL was not opened."
 ./verify.sh --wait-browser
 verification=$?
 case "$verification" in
