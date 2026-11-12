@@ -1,0 +1,22 @@
+# Bash, Python, Docker, Squid and Firefox read these files byte for byte, and several
+# are security inputs. Keep them LF in every checkout, whatever core.autocrlf says.
+# Attributes apply at checkout; they do not repair a file that already has CRLF in the
+# working tree, which is why the launcher also rejects carriage returns in the gateway
+# inputs before it changes anything.
+*.sh            text eol=lf
+*.py            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.json          text eol=lf
+*.conf          text eol=lf
+*.toml          text eol=lf
+*.md            text eol=lf
+Dockerfile      text eol=lf
+.dockerignore   text eol=lf
+.gitattributes  text eol=lf
+.gitignore      text eol=lf
+PINS.txt        text eol=lf
+LICENSE         text eol=lf
+gateway/**      text eol=lf
+policies/**     text eol=lf
+security/**     text eol=lf

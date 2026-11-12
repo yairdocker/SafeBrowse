@@ -1,0 +1,139 @@
+# ---------------------------------------------------------------------------
+# safebrowse - service definitions shared by both topologies.
+#
+# This file is never started on its own. docker-compose.yml (direct) and
+# docker-compose.vpn.yml (VPN) each extend these services and add the parts
+# that differ: networks, the gateway's hostname or network namespace, start
+# order and the mode label. Nothing about how a service reaches the network
+# belongs here.
+# ---------------------------------------------------------------------------
+
+services:
+
+  # --- the only way out ----------------------------------------------------
+  gateway:
+    image: ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029
+    container_name: safebrowse-gw
+    labels:
+      safebrowse.schema: "1"
+      safebrowse.session: ${SAFEBROWSE_SESSION:-manual}
+    # The upstream entrypoint tails files to stdout; disable that disk copy.
+    logging:
+      driver: none
+    volumes:
+      - ${SQUID_CONFIG_PATH:-./gateway/squid.conf}:/etc/squid/squid.conf:ro
+      - ./gateway/blocklist.txt:/etc/squid/blocklist.txt:ro
+    tmpfs:
+      - /var/log/squid:uid=13,gid=13,mode=0750,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:          # squid creates its cache dirs then drops to the proxy user
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    mem_limit: 512m
+    pids_limit: 256
+    restart: "no"
+
+  # --- publishes the remote desktop outside the isolated network.
+  #     Raw TCP passthrough: TLS stays
+  #     end-to-end between your Mac and the browser container.
+  uiproxy:
+    image: alpine/socat@sha256:ef6c281978dcd6927d9b3829484e4c4fdfc5d98de5acbd6312c04565d2d58cbf
+    container_name: safebrowse-ui
+    labels:
+      safebrowse.schema: "1"
+      safebrowse.session: ${SAFEBROWSE_SESSION:-manual}
+    command: ["TCP-LISTEN:3001,fork,reuseaddr", "TCP:safebrowse:3001"]
+    ports:
+      - "127.0.0.1:3011:3001"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 128m
+    pids_limit: 128
+    restart: "no"
+
+  # --- the untrusted thing (Firefox) -------------------------------------------------
+  safebrowse:
+    build:
+      context: .
+    image: safebrowse:latest
+    container_name: safebrowse
+    hostname: sandbox
+    labels:
+      safebrowse.schema: "1"
+      safebrowse.session: ${SAFEBROWSE_SESSION:-manual}
+
+    environment:
+      - PUID=1000
+      - PGID=1000
+      # UTC in every session, so the browser's clock zone says nothing about where
+      # you are or which network you leave by. This is one signal among many that
+      # a site can read; it is not fingerprinting protection.
+      - TZ=Etc/UTC
+      - CUSTOM_USER=${SANDBOX_USER:-sandbox}
+      - PASSWORD=${SANDBOX_PASSWORD:?set SANDBOX_PASSWORD in .env}
+      - TITLE=safebrowse
+      # The proxy, the ad blocker and every permission are set by Firefox
+      # enterprise policy (policies/firefox-policies.json), which a page
+      # cannot override. Nothing security-relevant rides on this flag.
+      - FIREFOX_CLI=about:blank
+
+      # --- close the bridges between your Mac and the sandbox -------------
+      # The remote desktop syncs the clipboard both ways by default and offers
+      # file upload/download through the web UI. Both are data paths in and out
+      # of an environment whose whole purpose is that nothing crosses it.
+      - SELKIES_CLIPBOARD_ENABLED=false
+      - SELKIES_CLIPBOARD_IN_ENABLED=false
+      - SELKIES_CLIPBOARD_OUT_ENABLED=false
+      - SELKIES_ENABLE_BINARY_CLIPBOARD=false
+      # Ignored by this image: it rejects both "none" and "" and falls back to
+      # upload,download. Left here to record the intent. Hiding the panel below
+      # removes the affordance but is cosmetic, not a control.
+      - SELKIES_FILE_TRANSFERS=
+      - SELKIES_UI_SIDEBAR_SHOW_FILES=false
+      - SELKIES_MICROPHONE_ENABLED=false
+
+    # Docker's embedded resolver (127.0.0.11) still answers for container
+    # names such as "gateway". This is the only place it may pass any other
+    # name on to: the browser container's own loopback, where nothing listens.
+    # Without this line the resolver holds the host's DNS servers and only
+    # skips them while every attached network is internal; with it, a name
+    # Docker does not know cannot leave this container on any network.
+    # Firefox web requests delegate DNS to the HTTP proxy. See README.md.
+    dns:
+      - 127.0.0.1
+
+    tmpfs:
+      - /config:uid=1000,gid=1000,mode=0700,size=1g
+      - /tmp:size=256m
+      - /run:exec,size=64m
+
+    security_opt:
+      - no-new-privileges:true
+      # Docker's default filter (moby/profiles seccomp v0.2.4) plus the three
+      # calls Firefox's own sandbox needs: clone with a new user namespace,
+      # unshare(CLONE_NEWPID) and chroot. See LINUX_SECURITY.md. Compose reads
+      # this file when it creates the container; it is not mounted or built in.
+      - seccomp=./security/seccomp-firefox.json
+    cap_drop:
+      - ALL
+    cap_add:          # the minimum s6-overlay needs to start and drop to uid 1000
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+      - KILL
+
+    mem_limit: 4g
+    cpus: 4.0
+    pids_limit: 1024
+    shm_size: "1gb"
+    restart: "no"

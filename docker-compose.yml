@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# safebrowse - disposable hardened Firefox with filtered egress.
+# safebrowse - disposable hardened Firefox with filtered egress. DIRECT mode.
 #
 #   host :3011 ──► uiproxy ──(internal)──► safebrowse (Firefox)
 #                                              │
@@ -9,133 +9,50 @@
 # route and no published ports. Docker DNS still resolves container names.
 # Its configured web path to the outside world is the Squid gateway, which refuses private address space,
 # non-web ports, and anything on the blocklist.
+#
+# This is one complete topology. The VPN topology is docker-compose.vpn.yml;
+# the launcher selects exactly one of the two files and never layers them.
+# What the services run is defined once, in compose.services.yml.
 # ---------------------------------------------------------------------------
 
 services:
 
-  # --- the only way out ----------------------------------------------------
   gateway:
-    image: ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029
-    container_name: safebrowse-gw
+    extends:
+      file: compose.services.yml
+      service: gateway
     hostname: gateway
-    # The upstream entrypoint tails files to stdout; disable that disk copy.
-    logging:
-      driver: none
-    volumes:
-      - ${SQUID_CONFIG_PATH:-./gateway/squid.conf}:/etc/squid/squid.conf:ro
-      - ./gateway/blocklist.txt:/etc/squid/blocklist.txt:ro
+    labels:
+      safebrowse.mode: direct
     networks:
       sandbox_net:
       egress_net:
-    tmpfs:
-      - /var/log/squid:uid=13,gid=13,mode=0750,size=16m
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:          # squid creates its cache dirs then drops to the proxy user
-      - CHOWN
-      - DAC_OVERRIDE
-      - FOWNER
-      - SETGID
-      - SETUID
-    mem_limit: 512m
-    pids_limit: 256
-    restart: "no"
 
-  # --- publishes the remote desktop outside the isolated network.
-  #     Raw TCP passthrough: TLS stays
-  #     end-to-end between your Mac and the browser container.
   uiproxy:
-    image: alpine/socat@sha256:ef6c281978dcd6927d9b3829484e4c4fdfc5d98de5acbd6312c04565d2d58cbf
-    container_name: safebrowse-ui
-    command: ["TCP-LISTEN:3001,fork,reuseaddr", "TCP:safebrowse:3001"]
-    ports:
-      - "127.0.0.1:3011:3001"
+    extends:
+      file: compose.services.yml
+      service: uiproxy
+    labels:
+      safebrowse.mode: direct
     networks:
       sandbox_net:
       egress_net:
     depends_on:
       - safebrowse
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    mem_limit: 128m
-    pids_limit: 128
-    restart: "no"
 
-  # --- the untrusted thing (Firefox) -------------------------------------------------
   safebrowse:
-    build:
-      context: .
-    image: safebrowse:latest
-    container_name: safebrowse
-    hostname: sandbox
-
+    extends:
+      file: compose.services.yml
+      service: safebrowse
+    labels:
+      safebrowse.mode: direct
     # No ports. No route off sandbox_net except through gateway.
     networks:
       sandbox_net:
-
-    environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=Australia/Melbourne
-      - CUSTOM_USER=${SANDBOX_USER:-sandbox}
-      - PASSWORD=${SANDBOX_PASSWORD:?set SANDBOX_PASSWORD in .env}
-      - TITLE=safebrowse
-      # The proxy, the ad blocker and every permission are set by Firefox
-      # enterprise policy (policies/firefox-policies.json), which a page
-      # cannot override. Nothing security-relevant rides on this flag.
-      - FIREFOX_CLI=about:blank
-
-      # --- close the bridges between your Mac and the sandbox -------------
-      # The remote desktop syncs the clipboard both ways by default and offers
-      # file upload/download through the web UI. Both are data paths in and out
-      # of an environment whose whole purpose is that nothing crosses it.
-      - SELKIES_CLIPBOARD_ENABLED=false
-      - SELKIES_CLIPBOARD_IN_ENABLED=false
-      - SELKIES_CLIPBOARD_OUT_ENABLED=false
-      - SELKIES_ENABLE_BINARY_CLIPBOARD=false
-      # Ignored by this image: it rejects both "none" and "" and falls back to
-      # upload,download. Left here to record the intent. Hiding the panel below
-      # removes the affordance but is cosmetic, not a control.
-      - SELKIES_FILE_TRANSFERS=
-      - SELKIES_UI_SIDEBAR_SHOW_FILES=false
-      - SELKIES_MICROPHONE_ENABLED=false
-
-    # No dns: key here on purpose. Docker's embedded resolver stays in place
-    # for container names; Firefox web requests delegate DNS to the HTTP proxy.
-
-    tmpfs:
-      - /config:uid=1000,gid=1000,mode=0700,size=1g
-      - /tmp:size=256m
-      - /run:exec,size=64m
-
-    security_opt:
-      - no-new-privileges:true
-      # Compatibility exception: the default filter blocks Firefox user
-      # namespaces on the tested host. This removes an outer defense; verify
-      # the live content-process filters and keep Docker's VM/kernel updated.
-      - seccomp=unconfined
-    cap_drop:
-      - ALL
-    cap_add:          # the minimum s6-overlay needs to start and drop to uid 1000
-      - CHOWN
-      - DAC_OVERRIDE
-      - FOWNER
-      - SETGID
-      - SETUID
-      - KILL
-
-    mem_limit: 4g
-    cpus: 4.0
-    pids_limit: 1024
-    shm_size: "1gb"
     depends_on:
       - gateway
-    restart: "no"
 
+# Keep these two definitions identical in docker-compose.vpn.yml.
 networks:
   # internal: true means Docker installs a firewall rule dropping anything
   # entering this bridge from outside its own subnet, and gives members no

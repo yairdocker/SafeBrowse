@@ -47,7 +47,8 @@ def choose(used, skipped=()):
 
 
 def atomic_write(path, contents, mode):
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=RUNTIME,
+    # newline="\n": written exactly as given on every platform, never as CRLF.
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=RUNTIME,
                                      prefix=".network-", delete=False) as file:
         temporary = Path(file.name)
         try:
@@ -59,8 +60,16 @@ def atomic_write(path, contents, mode):
             temporary.unlink(missing_ok=True)
 
 
+def read_exact(path):
+    """UTF-8 text with its line endings untouched, so a carriage return cannot be hidden."""
+    with open(path, encoding="utf-8", newline="") as file:
+        return file.read()
+
+
 def squid_config(subnet):
-    source = SOURCE.read_text()
+    source = read_exact(SOURCE)
+    if "\r" in source:
+        raise RuntimeError("gateway/squid.conf contains carriage returns; convert it to LF line endings")
     if len(DEFAULT_ACL.findall(source)) != 1:
         raise RuntimeError("expected exactly one sandbox source ACL in gateway/squid.conf")
     return DEFAULT_ACL.sub(f"acl sandbox src {subnet}", source)
@@ -79,13 +88,13 @@ def select(skipped=()):
 def current():
     if RUNTIME.is_symlink() or STATE.is_symlink() or SQUID.is_symlink():
         raise RuntimeError("runtime network files must not be symlinks")
-    data = json.loads(STATE.read_text())
+    data = json.loads(read_exact(STATE))
     if set(data) != {"subnet"}:
         raise ValueError("invalid runtime network state")
     subnet = ipaddress.ip_network(data["subnet"], strict=True)
     if subnet.version != 4 or subnet.prefixlen != 24 or not any(subnet.subnet_of(pool) for pool in POOLS):
         raise ValueError("invalid runtime sandbox subnet")
-    if SQUID.read_text() != squid_config(subnet):
+    if read_exact(SQUID) != squid_config(subnet):
         raise ValueError("runtime Squid configuration does not match the selected subnet")
     return subnet
 

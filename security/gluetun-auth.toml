@@ -1,0 +1,12 @@
+# Gluetun control-server authorisation for SafeBrowse's VPN mode.
+#
+# Gluetun v3.41.3 always starts its control server and, with no file here,
+# lets any local client read and change the VPN state without credentials
+# (for example PUT /v1/vpn/status). SafeBrowse binds that server to loopback
+# and mounts this file so that the only route with a role is the version
+# string. Every other route has no role and answers 401. There is no secret
+# in this file and none is needed: nothing in SafeBrowse calls the server.
+[[roles]]
+name = "version-only"
+routes = ["GET /v1/version"]
+auth = "none"

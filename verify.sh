@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")"
-command -v python3 >/dev/null 2>&1 || { echo "Python 3.9+ is required for ./verify.sh" >&2; exit 1; }
-exec python3 scripts/verify.py "$@"
+# Rerun the automated checks against the running sandbox.
+# Thin wrapper: the implementation is scripts/safebrowse.py. Arguments pass through
+# unchanged and the exit status is the launcher's own.
+case "${BASH_SOURCE[0]}" in */*) here=${BASH_SOURCE[0]%/*} ;; *) here=. ;; esac
+command -v python3 >/dev/null 2>&1 || {
+  echo "python3 was not found on your PATH. Install Python 3.12 or newer, open a new terminal, then rerun ./verify.sh." >&2
+  exit 1
+}
+exec python3 "$here/scripts/safebrowse.py" verify "$@"
