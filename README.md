@@ -15,9 +15,12 @@ No X11, no XQuartz, no GPU passthrough — the container ships a remote desktop
 you open at `https://127.0.0.1:3011/`. Audio works, so video plays with sound.
 
 Built and tested on **macOS + Docker Desktop (Apple Silicon)**. Native Linux
-has a defined target (Ubuntu 24.04 with a rootful Docker Engine) but **has not
-been run there**, so treat it as experimental; see
-[LINUX_SECURITY.md](LINUX_SECURITY.md). Windows and WSL2 are not supported.
+has a defined target (Ubuntu 24.04 with a rootful Docker Engine) and is still
+**experimental**. It has been exercised once, on a GitHub-hosted `ubuntu-24.04`
+runner: the direct-mode suites passed there, and the VPN suite failed a
+kill-switch capture check that is not yet explained. No other Linux
+installation has been run; see [LINUX_SECURITY.md](LINUX_SECURITY.md). Windows
+and WSL2 are not supported.
 
 Requires **Docker Engine 28+**, Compose v2 and **Python 3.12+** on the host.
 Bash is needed only for the `./*.sh` commands, which are thin wrappers; curl is
@@ -71,10 +74,12 @@ status, so these are equivalent:
 python3 scripts/safebrowse.py run --resume --url https://example.com/
 ```
 
-Either form works from any directory. The Python entry point has only been
-runtime-tested on macOS, with Python 3.12 and 3.14. It has not been run on a
-Linux host: CI is configured for Ubuntu 24.04, but no passing run has been
-observed yet. It does not make Windows a supported host.
+Either form works from any directory. The Python entry point has been
+runtime-tested on macOS, with Python 3.12 and 3.14, and once on a GitHub-hosted
+Ubuntu 24.04 runner with Python 3.12, where the direct-mode launcher suite
+passed and the VPN suite did not (see [LINUX_SECURITY.md](LINUX_SECURITY.md)).
+No other Linux host has been run, and no CI run has passed. It does not make
+Windows a supported host.
 
 If a session already exists, a plain `./run.sh` refuses to replace or reuse it.
 `--resume` requires all session containers to be running and never rebuilds or
@@ -190,7 +195,7 @@ fingerprinting protection.
 | `cap_drop: ALL` + minimum re-add | Six capabilities instead of the default fourteen. |
 | `no-new-privileges` | No setuid escalation inside the container. |
 | Seccomp profile `security/seccomp-firefox.json` | Docker's default syscall filter plus three calls Firefox's own sandbox needs. Replaces the earlier `seccomp=unconfined`. |
-| AppArmor `docker-default` (Linux hosts with AppArmor) | Docker's default container profile; expected on Ubuntu, not available in Docker Desktop. Not yet observed. |
+| AppArmor `docker-default` (Linux hosts with AppArmor) | Docker's default container profile; expected on Ubuntu, not available in Docker Desktop. Observed in enforce mode on one GitHub-hosted Ubuntu 24.04 runner; not on any other Linux installation. |
 | UI bound to `127.0.0.1` | Nothing on your network can reach it. |
 | `mem_limit` / `cpus` / `pids_limit` | A cryptominer hits a ceiling instead of your fans. |
 
@@ -423,18 +428,33 @@ production parser, generated configuration, pinned Gluetun image, Compose
 topology, firewall rules and verifier; only names, port, state directory and the
 permission to use a private endpoint are fixture settings, set in Python. It
 injects faults (route loss, interface removal, peer outage, container restart,
-stop/start and recreation) from a helper container and records every packet on
-the VPN container's egress interface. Its results on macOS are summarised in
-[VPN_SECURITY.md](VPN_SECURITY.md).
+stop/start and recreation) from a helper container and records every non-ARP
+packet on the VPN container's egress interface, in a separate capture for each
+scenario. A capture is accepted only if all of it is WireGuard to or from the
+peer. When one is not, the suite prints the rejected packets before it fails,
+and it can keep every capture: see *Capture diagnostics* in
+[VPN_SECURITY.md](VPN_SECURITY.md), which also summarises the results.
 
-GitHub Actions is configured to run the offline tests on `ubuntu-24.04` with
-Python 3.12 and 3.14, and the three integration suites with Python 3.12. The
-integration job first prints the runner's host and daemon security settings
+GitHub Actions runs the offline tests on `ubuntu-24.04` with Python 3.12 and
+3.14, and the three integration suites with Python 3.12. The integration job
+first prints the runner's host and daemon security settings
 (`tests/host_baseline.py`) and finally fails if they differ from the Linux
 baseline, because a hosted runner is not necessarily a stock Ubuntu
-installation. All of that is configured coverage, not an observed result: the
-workflow has not run, so inspect a passing run before treating Linux as
-verified.
+installation. It then uploads the VPN suite's capture evidence as an artifact
+named `vpn-capture-diagnostics-<run>-<attempt>`, kept for seven days, whether
+the job passed or failed.
+
+The workflow has run once on the current code, for commit `0ffe724`, and
+[that run](https://github.com/yairdocker/SafeBrowse/actions/runs/43333272449) **failed**. On an x86_64 runner (kernel 7.0.0-1017-azure,
+Docker Engine 28.0.4, Compose 2.38.2, AppArmor enabled) the offline tests passed
+on both Python versions (338 each), `tests/integration.py` passed 58 checks,
+`tests/cli_integration.py` passed 34, and the runner matched the Linux
+baseline. `tests/integration_vpn.py` passed 95 checks and then failed its
+route-loss capture check, so the checks after it did not run. The count in that
+failure covered one capture of both directions since the start of normal
+operation, and its rejected packets were neither printed nor kept, so the cause
+is not known. That run predates the artifact upload. No passing run exists. These are observations of one hosted runner, not a verified
+Linux result: see [LINUX_SECURITY.md](LINUX_SECURITY.md).
 
 Run `python3 tests/host_baseline.py` on any host to print the same facts. It
 only reads.
@@ -484,9 +504,11 @@ know you don't.
   attacker into that VM. This is strong isolation, not a guarantee.
 - **Native Linux has no such VM.** There the container shares the host's own
   kernel, so the same kernel bug is more serious, and the Linux configuration
-  has not been validated at all yet. See [LINUX_SECURITY.md](LINUX_SECURITY.md).
-- **VPN mode has only been run against a controlled peer, on macOS.** No real
-  Mullvad server, no Linux host. It hides your address from sites; it is not
+  is not validated: it has been exercised on one GitHub-hosted runner only, in
+  a run that failed. See [LINUX_SECURITY.md](LINUX_SECURITY.md).
+- **VPN mode has only passed against a controlled peer, on macOS.** No real
+  Mullvad server. On the one Linux runner it was tried on, a kill-switch
+  capture check failed and is unexplained. It hides your address from sites; it is not
   anonymity, and the VPN provider sees what the gateway connects to. See
   [VPN_SECURITY.md](VPN_SECURITY.md).
 - **The seccomp profile is wider than Docker's default.** It additionally lets
@@ -541,6 +563,7 @@ tests/test_*.py                 offline security, launcher and wrapper regressio
 tests/integration.py            real stack against disposable local fixtures
 tests/cli_integration.py        real launcher against a disposable fixture session
 tests/integration_vpn.py        real launcher in VPN mode against a fixture WireGuard peer
+tests/vpn_capture.py            that suite's capture windows and failure diagnostics
 tests/host_baseline.py          read-only record of host and daemon security settings
 .dockerignore                   allowlist of build inputs; excludes .env and .git
 ```
