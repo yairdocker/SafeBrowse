@@ -352,6 +352,26 @@ class WindowTests(CaptureCase):
                 self.assertEqual(len(self.printed("DIAG  rejected  ")), 1)
                 self.assertIn(f"evidence: not kept: rerun with {vpn_capture.VARIABLE} set", report)
 
+    def test_inbound_solicitation_can_wait_for_route_loss_but_still_fails_the_run(self):
+        capture = self.capture(Docker({1: [OUT_TUNNEL, UNMATCHED["IPv6"]]}))
+        with self.assertRaisesRegex(RuntimeError, "01-normal-operation"), capture.record():
+            route_loss = capture.check(capture.open("normal operation"), then="route loss", defer_inbound_solicitations=True)
+            capture.check(route_loss)
+            capture.finish()
+        run = json.loads((self.directory / "run.json").read_text())
+        self.assertEqual(run["outcome"], "failed")
+        self.assertEqual([w["verdict"] for w in run["windows"]], ["rejected", "accepted"])
+
+    def test_other_rejections_and_unmeasured_solicitations_still_stop_immediately(self):
+        inbound = UNMATCHED["IPv6"]
+        outbound = (frame(OWN, "33:33:00:00:00:02", 0x86dd), inbound[1])
+        for packets, settings in (([inbound, outbound], {}), ([inbound], {"no_link_address": True}),
+                                  ([UNMATCHED["inbound to the egress address"]], {}), ([], {})):
+            with self.subTest(packets=packets, settings=settings):
+                capture = self.capture(Docker({1: packets}, **settings), directory=None)
+                with self.assertRaisesRegex(RuntimeError, "on the egress interface"):
+                    capture.check(capture.open("normal operation"), defer_inbound_solicitations=True)
+
     def test_a_measured_direction_never_rescues_or_condemns_a_packet(self):
         inbound_leak = UNMATCHED["inbound to the egress address"]
         tunnel_line_from_a_stranger = (frame(OTHER_LINK, BROADCAST, 0x86dd), OUT_TUNNEL[1])
@@ -872,8 +892,8 @@ class SuiteWiringTests(unittest.TestCase):
             self.assertNotIn(removed, self.source)
 
     def test_a_window_is_recording_before_each_fault_is_injected(self):
-        order = ['capture.check(window, then="route loss")', '"ip", "route", "del", "default"',
-                 'capture.check(window, then="route restoration")', '"ip", "route", "add", "default"',
+        order = ['capture.check(window, then="route loss", defer_inbound_solicitations=True)', '"ip", "route", "del", "default"',
+                 'capture.check(window, then="route restoration")', 'capture.require_expected_verdicts()', '"ip", "route", "add", "default"',
                  'capture.check(window, then="interface removal and reconnect")', '"ip", "link", "del"',
                  'capture.check(window, then="peer outage")', '"docker", "stop", "--time", "1", project + "-peer"',
                  'capture.check(window, then="peer recovery")', '"docker", "start", project + "-peer"',

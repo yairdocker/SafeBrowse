@@ -358,7 +358,7 @@ class Capture:
             self._settle(window)
         return window
 
-    def check(self, window, quiet=False, then=None):
+    def check(self, window, quiet=False, then=None, *, defer_inbound_solicitations=False):
         """The suite's assertion: every packet in the window was WireGuard to or from the peer.
 
         `then` names the next window. It is opened, and recording, before this one is stopped, so no packet
@@ -369,11 +369,22 @@ class Capture:
         total = len(window.lines)
         message = f"{window.scenario}: all {total} packets on the egress interface were WireGuard to or from the peer"
         if not acceptable(total, window.rejected, quiet):
+            if defer_inbound_solicitations and window.rejected and not self.export_errors and all(
+                    direction(window.frames[i], window.linktype, window.own, window.lines[i], window.vpn_ip)
+                    == ("inbound", "measured") and " > ff02::2: ICMP6, router solicitation," in window.lines[i]
+                    for i in window.rejected):
+                self.emit(f"FAIL  {window.name}: inbound router solicitation. Continuing to collect route-loss evidence.")
+                return following
             raise RuntimeError(message)
         self.emit(f"PASS  {message}")
         return following
 
     # ------------------------------------------------------------------ the end of a run
+    def require_expected_verdicts(self):
+        failed = [w.name for w in self.windows if w.as_expected() is False]
+        if failed:
+            raise RuntimeError("unexpected capture verdict in " + ", ".join(failed))
+
     @contextlib.contextmanager
     def record(self):
         """Around the whole suite: a run that leaves by an exception is recorded as failed, whatever it reached."""
@@ -409,6 +420,7 @@ class Capture:
         """The suite passed. Every window must have been checked, and requested evidence must have been written."""
         if self.active:
             raise CaptureError("capture windows were opened and never checked: " + ", ".join(w.name for w in self.active))
+        self.require_expected_verdicts()
         self.outcome, self.finished = "passed", self.clock()
         self._index()
         if self.export_errors:
