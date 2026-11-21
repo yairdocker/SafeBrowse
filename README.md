@@ -14,13 +14,12 @@ The default remains a direct connection.
 No X11, no XQuartz, no GPU passthrough — the container ships a remote desktop
 you open at `https://127.0.0.1:3011/`. Audio works, so video plays with sound.
 
-Built and tested on **macOS + Docker Desktop (Apple Silicon)**. Native Linux
-has a defined target (Ubuntu 24.04 with a rootful Docker Engine) and is still
-**experimental**. It has been exercised once, on a GitHub-hosted `ubuntu-24.04`
-runner: the direct-mode suites passed there, and the VPN suite failed a
-kill-switch capture check that is not yet explained. No other Linux
-installation has been run; see [LINUX_SECURITY.md](LINUX_SECURITY.md). Windows
-and WSL2 are not supported.
+Built and tested on **macOS + Docker Desktop (Apple Silicon)**. Direct and VPN
+mode also passed the full suite on a GitHub-hosted Ubuntu 24.04 runner.
+**Native Linux remains experimental** until the release checks pass on a stock
+Ubuntu 24.04 installation with rootful Docker. Windows and WSL2 are unsupported.
+[Hosted run](https://github.com/yairdocker/SafeBrowse/actions/runs/44850697203) ·
+[Native Linux release gate](LINUX_SECURITY.md#release-gate-for-native-linux)
 
 Requires **Docker Engine 28+**, Compose v2 and **Python 3.12+** on the host.
 Bash is needed only for the `./*.sh` commands, which are thin wrappers; curl is
@@ -74,12 +73,9 @@ status, so these are equivalent:
 python3 scripts/safebrowse.py run --resume --url https://example.com/
 ```
 
-Either form works from any directory. The Python entry point has been
-runtime-tested on macOS, with Python 3.12 and 3.14, and once on a GitHub-hosted
-Ubuntu 24.04 runner with Python 3.12, where the direct-mode launcher suite
-passed and the VPN suite did not (see [LINUX_SECURITY.md](LINUX_SECURITY.md)).
-No other Linux host has been run, and no CI run has passed. It does not make
-Windows a supported host.
+Either form works from any directory. The launcher has run on macOS with Python
+3.12 and 3.14. The hosted Ubuntu integration suites exercised it with Python
+3.12 in direct and VPN mode.
 
 If a session already exists, a plain `./run.sh` refuses to replace or reuse it.
 `--resume` requires all session containers to be running and never rebuilds or
@@ -195,7 +191,7 @@ fingerprinting protection.
 | `cap_drop: ALL` + minimum re-add | Six capabilities instead of the default fourteen. |
 | `no-new-privileges` | No setuid escalation inside the container. |
 | Seccomp profile `security/seccomp-firefox.json` | Docker's default syscall filter plus three calls Firefox's own sandbox needs. Replaces the earlier `seccomp=unconfined`. |
-| AppArmor `docker-default` (Linux hosts with AppArmor) | Docker's default container profile; expected on Ubuntu, not available in Docker Desktop. Observed in enforce mode on one GitHub-hosted Ubuntu 24.04 runner; not on any other Linux installation. |
+| AppArmor `docker-default` (Linux hosts with AppArmor) | The browser ran under Docker's default container profile in enforce mode on hosted Ubuntu 24.04. Docker Desktop on the tested Mac does not provide AppArmor. |
 | UI bound to `127.0.0.1` | Nothing on your network can reach it. |
 | `mem_limit` / `cpus` / `pids_limit` | A cryptominer hits a ceiling instead of your fans. |
 
@@ -447,17 +443,14 @@ installation. It then uploads the VPN suite's capture evidence as an artifact
 named `vpn-capture-diagnostics-<run>-<attempt>`, kept for seven days, whether
 the job passed or failed.
 
-The workflow has run once on the current code, for commit `0ffe724`, and
-[that run](https://github.com/yairdocker/SafeBrowse/actions/runs/43333272449) **failed**. On an x86_64 runner (kernel 7.0.0-1017-azure,
-Docker Engine 28.0.4, Compose 2.38.2, AppArmor enabled) the offline tests passed
-on both Python versions (338 each), `tests/integration.py` passed 58 checks,
-`tests/cli_integration.py` passed 34, and the runner matched the Linux
-baseline. `tests/integration_vpn.py` passed 95 checks and then failed its
-route-loss capture check, so the checks after it did not run. The count in that
-failure covered one capture of both directions since the start of normal
-operation, and its rejected packets were neither printed nor kept, so the cause
-is not known. That run predates the artifact upload. No passing run exists. These are observations of one hosted runner, not a verified
-Linux result: see [LINUX_SECURITY.md](LINUX_SECURITY.md).
+On 21 November 2026, commit `77010d2` passed 392 offline tests on each Python
+version, 58 direct-mode checks, 34 launcher checks, 162 VPN checks and the
+host baseline check. During route loss, new requests failed and all 25 packets
+captured on the egress interface were WireGuard traffic to or from the fixture
+peer. In the deliberate-leak control, the observer received the request and
+the capture check rejected all 11 recorded packets.
+[Hosted run 44850697203](https://github.com/yairdocker/SafeBrowse/actions/runs/44850697203) ·
+[VPN capture evidence](VPN_SECURITY.md#on-a-github-hosted-linux-runner)
 
 Run `python3 tests/host_baseline.py` on any host to print the same facts. It
 only reads.
@@ -505,15 +498,13 @@ know you don't.
 - **Container escape is not impossible.** Docker Desktop runs containers in a
   Linux VM, which is a real boundary — but a kernel exploit chain gets an
   attacker into that VM. This is strong isolation, not a guarantee.
-- **Native Linux has no such VM.** There the container shares the host's own
-  kernel, so the same kernel bug is more serious, and the Linux configuration
-  is not validated: it has been exercised on one GitHub-hosted runner only, in
-  a run that failed. See [LINUX_SECURITY.md](LINUX_SECURITY.md).
-- **VPN mode has only passed against a controlled peer, on macOS.** No real
-  Mullvad server. On the one Linux runner it was tried on, a kill-switch
-  capture check failed and is unexplained. It hides your address from sites; it is not
-  anonymity, and the VPN provider sees what the gateway connects to. See
-  [VPN_SECURITY.md](VPN_SECURITY.md).
+- **Native Linux shares the host kernel.** A kernel escape would reach the host.
+  Validation on a stock Ubuntu 24.04 installation is still pending.
+  [Linux release gate](LINUX_SECURITY.md#release-gate-for-native-linux)
+- **VPN tests use a controlled WireGuard peer.** They passed on macOS and hosted
+  Ubuntu. Real Mullvad operation remains unverified. Sites see the VPN server's
+  address, and the provider sees the gateway's destinations.
+  [VPN evidence and limits](VPN_SECURITY.md#observed-results)
 - **The seccomp profile is wider than Docker's default.** It additionally lets
   processes in the browser container create user namespaces with their own
   network and IPC namespaces, because Firefox's sandbox needs that.

@@ -12,14 +12,13 @@ they were measured in the environment named in [Observed results](#observed-resu
 |---|---|
 | VPN mode on macOS + Docker Desktop, against a controlled WireGuard peer | observed |
 | VPN mode against a real Mullvad server | **NOT VERIFIED** |
-| VPN mode on a GitHub-hosted Ubuntu 24.04 runner (x86_64), against the same controlled peer | run once; **failed** a kill-switch capture check, cause unknown |
-| VPN mode on any other Linux host, and a passing CI run | **NOT VERIFIED** |
+| VPN mode on GitHub-hosted Ubuntu 24.04 (x86_64), against a controlled peer | All 162 VPN checks passed on 21 November 2026. [Hosted evidence](#on-a-github-hosted-linux-runner) |
+| VPN mode on a stock Ubuntu 24.04 installation or another native Linux host outside GitHub Actions | **NOT VERIFIED** |
 | Direct mode | unchanged; still the default |
 
-Native Linux remains experimental until the release gate in
-[LINUX_SECURITY.md](LINUX_SECURITY.md) is met. VPN mode does not change that,
-and VPN validation on Linux is incomplete: see
-[On a GitHub-hosted Linux runner](#on-a-github-hosted-linux-runner).
+**Native Linux remains experimental** until the release gate passes on stock
+Ubuntu 24.04. Validating VPN mode there also requires running the controlled-peer
+VPN suite on that host. [Native Linux release gate](LINUX_SECURITY.md#release-gate-for-native-linux)
 
 ## What it is, and what it is not
 
@@ -162,7 +161,7 @@ In VPN mode:
 | Granted | Why | Evidence |
 |---|---|---|
 | `NET_ADMIN` | Create the WireGuard interface, routes and firewall rules in its own namespace. | Gluetun starts and connects with this alone on Docker Desktop. |
-| `DAC_OVERRIDE` | Read the configuration, which is mode 0600 and owned by you, not by the container's root. | With real Linux file ownership a root process holding only `NET_ADMIN` gets `Permission denied`; with `DAC_OVERRIDE` it reads the file. Docker Desktop presents bind mounts as root-owned, so there it is not needed, but one configuration is kept. Measured on a volume inside the Docker Desktop VM. On the hosted Linux runner Gluetun read the bind-mounted 0600 file holding exactly these two capabilities, once; the refusal without `DAC_OVERRIDE` was not measured there, and no other native Linux bind mount has been tried. |
+| `DAC_OVERRIDE` | Read the user-owned configuration file with mode 0600. | On a volume inside the Docker Desktop VM, a root process with only `NET_ADMIN` received `Permission denied`. Adding `DAC_OVERRIDE` allowed the read. Docker Desktop presents host bind mounts as root-owned. On hosted Ubuntu, Gluetun read the bind-mounted 0600 file with exactly the two listed capabilities. Removing `DAC_OVERRIDE` on that host remains untested. |
 
 Not granted: `privileged`, `SYS_ADMIN`, `SYS_MODULE`, `NET_RAW`, any device
 (kernel WireGuard needs no `/dev/net/tun`; the userspace fallback is not
@@ -170,8 +169,9 @@ configured), host networking, sysctls. `DAC_READ_SEARCH` would also have read
 the file but was rejected: with it, Docker's default seccomp profile permits
 `open_by_handle_at`, a known way to reach host files.
 
-If the kernel has no WireGuard support, the VPN container fails to start and the
-launch fails. NOT VERIFIED on any kernel other than Docker Desktop's.
+The launcher requires kernel WireGuard support. The tunnel came up in Docker
+Desktop's VM and on the hosted Ubuntu runner. The failure path on a kernel
+without WireGuard remains unverified on native Linux.
 
 ## The pinned image
 
@@ -268,14 +268,13 @@ request for an IPv6 destination fails and no packet leaves.
 - **The browser container's resolver** is Docker's embedded one, needed to find
   `gateway`. In both modes the browser is created with `dns: 127.0.0.1`, which
   makes its own loopback address the only server that resolver may pass any
-  other name on to. Observed on Engine 29.9.2: `gateway` resolves; an external
-  name is refused (SERVFAIL) and no DNS packet leaves the container's loopback
-  interface. An internal network on its own is not enough: a control container
+  other name on to. On Docker Desktop Engine 29.9.2 and hosted Ubuntu Engine
+  28.0.4, `gateway` resolved, Docker's resolver refused external names, and the
+  capture saw no browser DNS packets outside loopback. A control container
   on the same internal network, given a resolver on that network, forwarded
   its queries there. `./verify.sh` checks the restriction and the behaviour
-  separately and passes only on both (see README.md, Verification). Other
-  engines are NOT VERIFIED; there the check fails or is inconclusive rather
-  than passing.
+  separately and passes only when it confirms both. Other Engine versions
+  remain unverified. [Verification](README.md#verification)
 - **Inside the VPN namespace** Docker's resolver is blocked (above).
 - Your file's `DNS =` line is recognised and not used: the gateway keeps its own
   filtering resolvers. The launcher says so.
@@ -496,34 +495,31 @@ again.
 
 ### On a GitHub-hosted Linux runner
 
-Environment: GitHub-hosted `ubuntu-24.04` runner, Ubuntu 24.04.5 LTS, x86_64,
-kernel 7.0.0-1017-azure, Docker Engine 28.0.4, Compose 2.38.2, AppArmor enabled,
-Python 3.12.16. One run, for commit `0ffe724`:
-[run 43333272449](https://github.com/yairdocker/SafeBrowse/actions/runs/43333272449). **The run failed.**
+**Passing run, 21 November 2026.** Commit `77010d2` passed all 162 VPN checks
+against the controlled WireGuard peer on a GitHub-hosted `ubuntu-24.04` x86_64
+runner. The suite exercised route loss and recovery, interface removal, peer
+outage, container restart and recreation, session changes, and teardown.
+[Workflow run 44850697203](https://github.com/yairdocker/SafeBrowse/actions/runs/44850697203) ·
+[Runner and baseline](LINUX_SECURITY.md#the-hosted-runner-run)
 
-The suite passed its first 95 checks there. The tunnel came up on a kernel
-WireGuard interface; requests and Squid's DNS queries arrived from the tunnel
-address; a host on the egress bridge and an IPv6 destination were unreachable;
-Gluetun read its 0600 configuration holding exactly `NET_ADMIN` and
-`DAC_OVERRIDE`; no key was found in container metadata, environment, labels or
-logs; and resume recreated nothing. After the tunnel's route was removed, new
-connections failed, the new requests arrived nowhere and the firewall's DROP
-counter rose.
+| Observation | Evidence from that run |
+|---|---|
+| Tunnel route removed during an established connection | The kernel selected the ordinary egress route. New requests failed, the test destination received none of them, and the firewall's DROP counter rose. |
+| Route-loss capture (`03-route-loss`) | All 25 non-ARP packets recorded on `egr0` were WireGuard traffic to or from the fixture peer. tcpdump counted 25 received by the filter, 25 captured and zero kernel drops. After the ordinary route was confirmed, seven recorded packets were inbound and the single outbound packet carried a 32-byte UDP payload to the WireGuard peer. No outbound traffic outside the tunnel was observed in this window. |
+| Inbound IPv6 router solicitations | The suite logged three confirmed solicitations, one each during secret handling and resume, interface removal and reconnect, and after restart. Eight ordinary windows passed all packet checks. |
+| Deliberate-leak control | With the test firewall opened for the observer, the observer received the request and the packet check rejected all 11 recorded packets in the ninth window. |
 
-The next check failed: `route loss: all 136 packets on the egress interface
-were WireGuard to or from the peer`. At that commit the suite kept a single
-capture from the start of normal operation, so 136 was a cumulative count, and
-the capture recorded both directions. The same capture had passed with 70
-packets earlier in the run, so at least one of the 66 packets recorded after
-that was not WireGuard between the VPN container and its peer. The run neither
-printed nor kept those packets. It therefore does not show whether something
-left by the ordinary route, which would be a leak, or something arrived on the
-bridge and was dropped. **The cause is unknown.**
+The artifact contains the raw pcaps, decoded summaries and per-window counts.
+[Integration log](https://github.com/yairdocker/SafeBrowse/actions/runs/44850697203/job/136681095904) ·
+[Capture artifact](https://github.com/yairdocker/SafeBrowse/actions/runs/44850697203/artifacts/14685257869)
 
-Every check after that one did not run on Linux: route restoration, interface
-removal, peer outage and recovery, restart, stop/start, recreation, mode
-changes, missing and damaged state, the positive control and teardown. None of
-the corresponding rows in the macOS table above has a Linux observation.
+**Earlier failure.** At commit `0ffe724`, the suite passed 95 VPN checks before
+the route-loss assertion failed. Its 136 packets came from a single
+bidirectional capture that started during normal operation. That run retained
+neither the packets nor their summaries, so the identity and direction of the
+rejected traffic remain unknown. Subsequent runs captured inbound router
+solicitations, but the original failure cannot be attributed to them.
+[Earlier run 43333272449](https://github.com/yairdocker/SafeBrowse/actions/runs/43333272449)
 
 ### Capture diagnostics
 
@@ -612,29 +608,18 @@ control rejected. A leak injected on purpose into a temporary copy of the suite
 was reported packet by packet, with the capture and the fixture's state kept,
 before that copy failed as it should.
 
-No CI run has produced this artifact yet, and none exists for run 43333272449,
-which predates it. A passing run on macOS does not resolve the Linux failure,
-and these diagnostics do not explain it; they exist so that the next Linux run
-can.
-
 ## Not verified
 
 - A real Mullvad account, server or exported file. No account was created or used.
-- VPN mode on Linux. The one run, on a GitHub-hosted Ubuntu 24.04 runner
-  (x86_64), failed its route-loss capture check; the cause is unknown and no
-  later check ran there. No other Linux host, kernel, Docker Engine or
-  architecture has been tried, and no CI run has passed.
-- The capture diagnostics on Linux. The windows, the export and the CI upload
-  step have run on macOS and offline only; the workflow change was checked by
-  parsing it, not by a run.
-- Kernel WireGuard availability beyond Docker Desktop's VM and that one runner.
-- Reading the 0600 configuration through a bind mount on native Linux, beyond
-  one successful read on that runner.
+- VPN operation on a stock Ubuntu 24.04 installation or another native Linux
+  host outside GitHub Actions, including kernel WireGuard availability and
+  Gluetun's ability to read the mode-0600 configuration through a bind mount.
 - Docker's embedded-resolver behaviour, including how it treats `dns: 127.0.0.1`,
-  on engines other than 29.9.2.
-- Ownership and permission checks on storage, and directory-relative file
-  operations, on anything but macOS. The fallback used where those operations do
-  not exist was exercised only by simulation on macOS.
+  outside the tested Engine 29.9.2 (Docker Desktop) and 28.0.4 (hosted Ubuntu)
+  configurations.
+- Storage ownership and permission checks on hosts outside macOS and hosted
+  Ubuntu. The fallback for systems without directory-relative file operations
+  has only been exercised in simulation.
 - `--fresh` after a real checkout rename, and the reporting of generated
   configuration kept after a failed launch. Both were exercised offline against
   a simulated Docker only.

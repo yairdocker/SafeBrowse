@@ -6,83 +6,51 @@ configured CI and intended support are kept apart on purpose.
 
 ## Status
 
-**Native Linux is not yet a supported or hardened platform.** Everything below
-that is marked *observed* was observed on macOS with Docker Desktop, unless it
-names another host. SafeBrowse has been run on one Linux host: a GitHub-hosted
-`ubuntu-24.04` runner, once, in a workflow run that failed (see
-[The hosted-runner run](#the-hosted-runner-run)). It has not been run on any
-other Linux installation. Treat native Linux as experimental until the release
-gate at the end of this file has been met on a real Ubuntu 24.04 host.
+**Native Linux remains experimental.** The full suite passed on GitHub-hosted
+Ubuntu 24.04 on 2026-11-21. Native Linux support still requires a run on a
+stock Ubuntu 24.04 installation with its security settings left as installed.
+See the [release gate for native Linux](#release-gate-for-native-linux).
+Measurements below refer to macOS with Docker Desktop unless a Linux host is named.
 
 | Host | State | Evidence |
 |---|---|---|
 | macOS 26.5 (arm64), Docker Desktop, Engine 29.9.2, Compose 5.6.1, VM kernel 7.0.14-linuxkit, Python 3.12 and 3.14 | Supported; observed | Offline tests and both container suites pass with the configuration described here (2026-11-12). The daemon reports `seccomp` (built-in profile) and no AppArmor. |
-| Ubuntu 24.04, rootful Docker Engine 28+, AppArmor and Ubuntu's user-namespace restriction left on, launched as a non-root user | Target baseline; **NOT VERIFIED** | Not run on any Ubuntu installation outside GitHub's runner image. The hosted-runner result in the next row is not a result for other installations. |
-| GitHub-hosted `ubuntu-24.04` runner: Ubuntu 24.04.5 LTS, x86_64, kernel 7.0.0-1017-azure, Docker Engine 28.0.4, Compose 2.38.2, AppArmor enabled, Python 3.12.16 and 3.14.10 | Observed once (2026-11-12); **the run failed** | Offline tests, both direct-mode suites and the baseline check passed. The VPN suite failed its route-loss capture check, and the cause is unknown. See *The hosted-runner run*. The runner is not assumed to be a stock Ubuntu installation. |
-| amd64 (any other host) | **NOT VERIFIED** | The profile and probes cover amd64. It has been run only on the hosted runner above; the macOS results are arm64. |
+| Stock Ubuntu 24.04, rootful Docker Engine 28+, AppArmor and Ubuntu's user-namespace restriction left on, launched as a non-root user | **Experimental. Release gate pending.** | A qualifying installation still needs the checks listed below. |
+| GitHub-hosted `ubuntu-24.04`, Ubuntu 24.04.5 LTS, x86_64, kernel 7.0.0-1017-azure, Docker Engine 28.0.4, Compose 2.38.2 | **Passed on 2026-11-21** | Offline tests on Python 3.12.16 and 3.14.10, both direct-mode suites, the controlled-peer VPN suite and the host baseline passed. [Hosted run](#the-hosted-runner-run) |
+| Other amd64 hosts | **NOT VERIFIED** | The amd64 results come from GitHub's hosted Ubuntu runners. |
 | Rootless Docker; launching as root or with `sudo` | Refused | See *Unsupported configurations*. |
 | Windows, WSL2, other Linux distributions, SELinux hosts | Outside this phase | Not tested. On a Linux daemon without AppArmor the verifier reports an inconclusive result. |
 
 ## The hosted-runner run
 
-One workflow run has exercised the current code on Linux:
-[run 43333272449](https://github.com/yairdocker/SafeBrowse/actions/runs/43333272449), for commit
-`0ffe724d7630c51ecf63aed7e3f8303b458ef168`, on 2026-11-12. Its conclusion is
-**failure**. This section records what its logs show and nothing more.
+The full workflow passed on 2026-11-21 at commit `77010d2`. The runner used
+the kernel, Engine and Compose versions in the table above. UID 1001 reached
+the rootful daemon through the default local Unix socket. The daemon reported
+cgroup v2, `overlay2`, AppArmor, built-in seccomp and `cgroupns`.
+`kernel.apparmor_restrict_unprivileged_userns` was 1. [Workflow run 44850697203](https://github.com/yairdocker/SafeBrowse/actions/runs/44850697203)
 
-The runner, as printed by `python3 tests/host_baseline.py` in that run: Ubuntu
-24.04.5 LTS, x86_64, kernel 7.0.0-1017-azure; Docker Engine 28.0.4, client and
-server, reached through the default Unix socket as UID 1001; Compose 2.38.2;
-cgroup v2 and `overlay2`; daemon security options `apparmor`, `seccomp`
-(built-in profile) and `cgroupns`;
-`kernel.apparmor_restrict_unprivileged_userns` set to 1.
-
-| Step | Result on that runner |
+| Check | Hosted result |
 |---|---|
-| Offline tests, Python 3.12.16 and 3.14.10 | 338 passed on each, none skipped. Shell syntax and Compose validation passed. |
-| `python3 tests/integration.py` | 58 checks passed. Among them: the browser was confined by AppArmor profile `docker-default` in enforce mode, user-namespace creation as Firefox's UID succeeded, and the outer seccomp filter was observed. |
-| `python3 tests/cli_integration.py` | 34 checks passed. |
-| `python3 tests/host_baseline.py --require-linux-baseline` | Exit 0: the runner matched the baseline. |
-| `python3 tests/integration_vpn.py` | 95 checks passed, then one failed. The checks after it did not run. |
+| Offline tests | 392 passed on each of Python 3.12.16 and 3.14.10. Shell syntax and Compose configuration also passed. |
+| `tests/integration.py` | 58 checks passed. The browser ran under `docker-default` in enforce mode. The verifier observed the outer seccomp filter and confirmed Firefox's UID could create and use a user namespace. |
+| `tests/cli_integration.py` | 34 launcher checks passed. |
+| `tests/integration_vpn.py` | 162 checks passed against the controlled WireGuard peer. |
+| `tests/host_baseline.py --require-linux-baseline` | Passed on this runner. |
 
-The failing check was `route loss: all 136 packets on the egress interface were
-WireGuard to or from the peer`. Three things about that line matter:
+During route loss, the kernel selected ordinary egress, new requests failed
+to reach their destination, and the firewall's output DROP counter rose. All
+25 non-ARP packets recorded on the egress interface in that window were
+WireGuard traffic between the VPN container and its peer. In the separate
+positive control, the observer received the deliberate request outside the
+tunnel and the capture check rejected all 11 recorded packets. The suite logged three
+confirmed inbound IPv6 router solicitations in other windows.
+[Integration log](https://github.com/yairdocker/SafeBrowse/actions/runs/44850697203/job/136681095904) · [Capture artifact](https://github.com/yairdocker/SafeBrowse/actions/runs/44850697203/artifacts/14685257869)
 
-- **The count was cumulative.** At that commit the suite kept one capture from
-  the start of normal operation. The same capture had passed with 70 packets at
-  the end of normal operation, so at least one of the 66 packets recorded after
-  that, through secret handling, resume and route loss, was not WireGuard
-  between the VPN container and its peer. The line does not say that 136
-  packets followed the route loss, or how many were rejected.
-- **The capture was bidirectional.** It recorded packets arriving on the
-  interface as well as packets leaving it. A rejected packet may have left the
-  VPN container by the ordinary route, which would be a leak, or may have
-  arrived from elsewhere on the bridge and been dropped by the firewall. A line
-  the pattern did not recognise would be rejected too.
-- **The packets were not printed or kept.** The run cannot tell these cases
-  apart. The cause is unknown.
-
-In the same run, immediately before that check, new connections failed after
-the route was removed, the new requests arrived nowhere, and the firewall's
-DROP counter rose. The checks that did not run cover route restoration,
-interface removal and reconnect, peer outage and recovery, restart, stop/start,
-recreation, mode changes, missing and damaged state, the positive control and
-teardown. Kill-switch behaviour under faults is therefore unresolved on Linux.
-
-What this run is, and is not:
-
-- It is one run on one hosted image, with a kernel and a preinstalled Docker
-  that GitHub chose. It says nothing about another Ubuntu installation, kernel,
-  Docker Engine or architecture.
-- Its passing steps are observations of that runner. They are recorded here so
-  that "never run on Linux" is no longer claimed; they do not make Linux
-  supported, and they do not meet the release gate below.
-- A failed run is not a passing CI run. There is none yet.
-
-The suite has since been changed to capture each scenario separately, to print
-rejected packets, and to upload its captures from CI. That is described in
-[VPN_SECURITY.md](VPN_SECURITY.md) under *Capture diagnostics*. No capture or
-artifact exists for run 43333272449: it predates those changes.
+The earlier workflow at `0ffe724` on 2026-11-12 passed 95 VPN checks before
+failing the route-loss assertion. Its bidirectional capture had grown from 70
+to 136 packets since the start of normal operation. The run did not retain
+or print the rejected packets, so their direction and the cause of that
+historical failure remain unknown. [Earlier run 43333272449](https://github.com/yairdocker/SafeBrowse/actions/runs/43333272449)
 
 ## Two separate layers
 
@@ -234,8 +202,7 @@ inconclusive and the message states that the error does not identify the layer.
 
 ## AppArmor and user namespaces on Ubuntu 24.04
 
-Nothing in this section has been tested. It is what the primary sources say and
-what the verifier will report.
+The hosted run exercised the browser under Ubuntu's AppArmor restrictions.
 
 - Docker generates and loads an AppArmor profile named `docker-default` and
   applies it to containers unless told otherwise. From Engine 29.8 the daemon
@@ -245,11 +212,10 @@ what the verifier will report.
   (`kernel.apparmor_restrict_unprivileged_userns`). The release notes say:
   "This affects all programs on the system that are unprivileged and unconfined."
   A container process under `docker-default` is confined, not unconfined.
-  Whether that profile, on a given kernel and Docker version, lets UID 1000
-  create a user namespace and then use it has been observed once: on the hosted
-  runner (kernel 7.0.0-1017-azure, Docker Engine 28.0.4) the verifier's two
-  calls succeeded under `docker-default` in enforce mode. No other kernel or
-  Docker version has been observed.
+  On the hosted kernel and Engine listed above, UID 1000 successfully ran
+  `clone(CLONE_NEWUSER)` followed by `unshare(CLONE_NEWPID)` under
+  `docker-default` in enforce mode. The stock-host gate requires the same
+  check with that installation's profile.
 - Firefox's start-up test includes the `unshare(CLONE_NEWPID)` step specifically
   to detect policies that allow creating a user namespace but nothing useful
   inside it. The verifier makes the same two calls.
@@ -324,9 +290,8 @@ proof of the daemon's identity:
   for Linux) is refused only because its kernel release differs from the host's.
 
 The tests for this check run offline against a simulated CLI. On macOS the
-check correctly refuses. It has been run on one Linux host, the GitHub-hosted
-runner described in *The hosted-runner run*, which it accepted. One acceptance
-of a hosted image does not move the release gate below.
+check correctly refuses. It accepted the hosted Ubuntu runner. The release
+gate below requires a separate observation on stock Ubuntu.
 
 ## Unsupported configurations
 
@@ -393,25 +358,14 @@ left as installed, and recorded here with the output of
    profile and the user-namespace settings are written into the table at the
    top of this file.
 
-**Current state: not met.** Items 1 to 3 were each observed once, on the
-GitHub-hosted runner described in
-[The hosted-runner run](#the-hosted-runner-run), and item 4 is recorded for
-that runner only. That is not what the gate asks for: it asks for an Ubuntu
-24.04 installation with its settings left as installed, and a hosted runner
-image is not assumed to be one. The workflow run they come from also failed as
-a whole. None of the four has been observed on any other Linux host.
+**Gate pending.** GitHub's hosted image passed all listed checks. A stock
+Ubuntu 24.04 installation with its original security settings still needs
+its own run and recorded results.
 
-VPN mode ([VPN_SECURITY.md](VPN_SECURITY.md)) is outside this gate and adds
-Linux unknowns of its own: kernel WireGuard from inside a container, reading
-the 0600 configuration through a bind mount, named interfaces and the embedded
-resolver on the baseline's Docker Engine, and AppArmor's effect on the VPN
-container. Meeting the gate above does not verify VPN mode on Linux; that also
-needs `python3 tests/integration_vpn.py` to pass there. It has been run on one
-Linux host, the hosted runner, and failed: the tunnel came up and the checks
-before the failure passed, including a kernel WireGuard interface and Gluetun
-reading its 0600 configuration through a bind mount, and then the route-loss
-capture check failed for a reason that is not known. It has not passed on any
-Linux host, so Linux VPN validation is incomplete.
+VPN validation on that stock installation also requires
+`python3 tests/integration_vpn.py` to pass there. The hosted result covers
+the controlled peer on the recorded runner configuration.
+[VPN evidence and remaining validation](VPN_SECURITY.md#on-a-github-hosted-linux-runner)
 
 ## Sources
 
