@@ -1,0 +1,227 @@
+name: Stock Ubuntu amd64 release gate
+on:
+  push:
+    branches: [codex/stock-noble-amd64-gate]
+permissions:
+  contents: read
+jobs:
+  stock:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_SHA: 1b6329e6cbaf84c5ba566565258f36c8fd5b211e
+      IMAGE_SHA: 04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 1b6329e6cbaf84c5ba566565258f36c8fd5b211e
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Boot pristine Ubuntu amd64 using KVM
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/stock-amd64"
+          mkdir -m 700 "$work"
+          mkdir -m 700 "$work/evidence"
+          cd "$work"
+          test "$(uname -m)" = x86_64
+          test -c /dev/kvm || { echo 'The outer runner does not expose /dev/kvm'; exit 1; }
+          sudo apt-get -qq update
+          sudo apt-get -qq install --no-install-recommends -y acl qemu-system-x86 qemu-utils seabios cloud-image-utils genisoimage
+          sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+          test -w /dev/kvm
+          image_url=https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img
+          curl -fsSL --retry 3 -o ubuntu.img "$image_url"
+          printf '%s  ubuntu.img\n' "$IMAGE_SHA" | sha256sum -c -
+          printf 'image=%s\nsha256=%s\nouter_runner=%s\nacceleration=KVM\nsource=%s\n' "$image_url" "$IMAGE_SHA" "$RUNNER_NAME" "$SOURCE_SHA" > evidence/provenance.txt
+          qemu-system-x86_64 --version >> evidence/provenance.txt
+          git -C "$GITHUB_WORKSPACE" rev-parse --verify HEAD | grep -Fx "$SOURCE_SHA"
+          test -z "$(git -C "$GITHUB_WORKSPACE" status --porcelain)"
+          git init -q --bare source.git
+          git -C source.git fetch -q "$GITHUB_WORKSPACE" "$SOURCE_SHA:refs/remotes/origin/main"
+          git -C source.git bundle create "$work/merged-main.bundle" refs/remotes/origin/main
+          git bundle list-heads merged-main.bundle | tee -a evidence/provenance.txt | grep -Fx "$SOURCE_SHA refs/remotes/origin/main"
+          ssh-keygen -q -t ed25519 -N '' -C 'stock-gate' -f key
+          { printf '#cloud-config\nssh_authorized_keys:\n'; sed 's/^/  - /' key.pub; } > user-data
+          printf 'instance-id: safebrowse-kvm-%s-%s\nlocal-hostname: safebrowse-gate\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > meta-data
+          cloud-localds seed.img user-data meta-data
+          qemu-img create -q -f qcow2 -F qcow2 -b "$work/ubuntu.img" guest.qcow2 26G
+          # Use a dedicated guest kernel, root disk and system Docker daemon.
+          # Requiring KVM and the host CPU prevents silently running the gate under TCG.
+          qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp 4 -m 8G \
+            -drive file=guest.qcow2,if=virtio,format=qcow2 -drive file=seed.img,if=virtio,format=raw,readonly=on \
+            -nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:32222-:22 -display none -monitor none \
+            -serial "file:$work/evidence/boot.log" -qmp "unix:$work/qmp.sock,server=on,wait=off" -pidfile qemu.pid -daemonize
+          python3 - <<'PY' | tee evidence/kvm.json
+          import json, socket
+          with socket.socket(socket.AF_UNIX) as monitor:
+              monitor.settimeout(10)
+              monitor.connect("qmp.sock")
+              stream = monitor.makefile("rb")
+              assert "QMP" in json.loads(stream.readline())
+              for command in ("qmp_capabilities", "query-kvm"):
+                  monitor.sendall(json.dumps({"execute": command}).encode() + b"\n")
+                  reply = json.loads(stream.readline())
+                  while "event" in reply:
+                      reply = json.loads(stream.readline())
+                  result = reply["return"]
+              print(json.dumps(result))
+              assert result["present"] and result["enabled"]
+          PY
+          cat > ssh-guest <<'SSH'
+          #!/bin/bash
+          set -eu
+          work="$RUNNER_TEMP/stock-amd64"
+          exec ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+            -o "UserKnownHostsFile=$work/known_hosts" -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=6 \
+            -o ServerAliveInterval=30 -i "$work/key" -p 32222 ubuntu@127.0.0.1 "$@"
+          SSH
+          chmod 700 ssh-guest
+          for try in {1..90}; do
+            if ./ssh-guest true </dev/null 2>/dev/null; then break; fi
+            kill -0 "$(cat qemu.pid)" || exit 1
+            sleep 3
+          done
+          ./ssh-guest 'cloud-init status --wait' </dev/null | tee evidence/cloud-init.log
+      - name: Verify installed security defaults and install Ubuntu Docker packages
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/stock-amd64"
+          cat > stock-settings.sh <<'GUEST'
+          #!/bin/bash
+          set -eu
+          . /etc/os-release
+          test "$ID" = ubuntu && test "$VERSION_ID" = 24.04
+          test "$(uname -m)" = x86_64
+          test "$(id -u)" = 1000
+          test "$(umask)" = 0002
+          test "$(cat /sys/module/apparmor/parameters/enabled)" = Y
+          test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
+          printf 'OS=%s\narch=%s\nkernel=%s\nuid=%s\numask=%s\nAppArmor=%s\n' "$PRETTY_NAME" "$(uname -m)" "$(uname -r)" "$(id -u)" "$(umask)" "$(cat /sys/module/apparmor/parameters/enabled)"
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.apparmor_restrict_unprivileged_unconfined kernel.unprivileged_userns_clone user.max_user_namespaces
+          cat /proc/cmdline
+          GUEST
+          ./ssh-guest 'bash -se' < stock-settings.sh | tee evidence/before-install.log
+          ./ssh-guest 'bash -se' <<'GUEST' 2>&1 | tee evidence/packages.log
+          sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update
+          sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 -o Acquire::Retries=3 install -y docker.io docker-compose-v2 docker-buildx git curl openssl
+          sudo -n usermod -aG docker ubuntu
+          sudo -n systemctl is-active docker
+          GUEST
+          ./ssh-guest 'bash -se' < stock-settings.sh | tee evidence/after-install.log
+          cmp evidence/before-install.log evidence/after-install.log
+          ./ssh-guest 'id && docker version && docker compose version && docker buildx version' </dev/null | tee evidence/guest-docker.log
+      - name: Run the release gate inside the stock guest
+        timeout-minutes: 50
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/stock-amd64"
+          cat > run-gate.sh <<'GUEST'
+          #!/bin/bash
+          set -eu
+          test "$(uname -m)" = x86_64
+          . /etc/os-release
+          test "$ID" = ubuntu && test "$VERSION_ID" = 24.04
+          test "$(id -u)" -ne 0
+          test "$(umask)" = 0002
+          evidence="$HOME/gate-evidence"
+          mkdir -m 700 "$evidence"
+          cd "$HOME"
+          mkdir SafeBrowse
+          cd SafeBrowse
+          git init -q -b main
+          git fetch -q "$HOME/merged-main.bundle" refs/remotes/origin/main
+          git merge -q --ff-only FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "1b6329e6cbaf84c5ba566565258f36c8fd5b211e"
+          test -z "$(git status --porcelain)"
+          {
+              date -u
+              id
+              printf 'umask='
+              umask
+              uname -srmo
+              cat /etc/os-release
+              python3.12 --version
+              git log -1 --format='commit=%H%nparents=%P%ntree=%T%nsubject=%s'
+              git status --porcelain=v1 --branch
+              lscpu | grep -E '^Architecture:|^Model name:|^Hypervisor vendor:|^Virtualization type:'
+          } > "$evidence/candidate.txt"
+          cat "$evidence/candidate.txt"
+
+          export PYTHONDONTWRITEBYTECODE=1
+          gate_failed=0
+          run_check() {
+              local name="$1" rc=0
+              shift
+              printf 'Starting %s at %s\n' "$name" "$(date -u +%T)"
+              "$@" </dev/null > "$evidence/$name.log" 2>&1 || rc=$?
+              printf '%s\t%s\n' "$name" "$rc" >> "$evidence/results.tsv"
+              printf 'Finished %s, exit %s at %s\n' "$name" "$rc" "$(date -u +%T)"
+              tail -n 4 "$evidence/$name.log"
+              if test "$rc" -ne 0; then gate_failed=1; fi
+          }
+          check_shell() {
+              local script
+              for script in *.sh scripts/*.sh; do
+                  if test -f "$script"; then bash -n "$script" || return 1; fi
+              done
+          }
+          run_check baseline python3.12 tests/host_baseline.py --require-linux-baseline
+          run_check syntax check_shell
+          run_check compose-direct env SANDBOX_PASSWORD=validation-only-not-a-session docker compose -f docker-compose.yml config --quiet
+          run_check compose-vpn env SANDBOX_PASSWORD=validation-only-not-a-session docker compose -f docker-compose.vpn.yml config --quiet
+          run_check offline python3.12 -m unittest discover -s tests -v
+          run_check direct python3.12 -u tests/integration.py
+          run_check launcher python3.12 -u tests/cli_integration.py
+          run_check vpn env SAFEBROWSE_VPN_DIAGNOSTICS_DIR="$evidence/vpn-captures" python3.12 -u tests/integration_vpn.py
+          run_check baseline-after python3.12 tests/host_baseline.py --require-linux-baseline
+          git diff --exit-code HEAD > "$evidence/source-diff-after.log" || gate_failed=1
+          exit "$gate_failed"
+          GUEST
+          tar -czf - merged-main.bundle run-gate.sh | ./ssh-guest 'tar -xzf -'
+          ./ssh-guest 'bash run-gate.sh' </dev/null 2>&1 | tee evidence/gate-progress.log
+      - name: Collect guest evidence and verify final settings
+        if: always()
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/stock-amd64"
+          test -x ssh-guest && test -s stock-settings.sh
+          mkdir -p evidence/guest
+          # Preserve individual results and any incomplete VPN windows even when a suite fails.
+          ./ssh-guest 'tar -C gate-evidence -czf - .' </dev/null | tar -xzf - -C evidence/guest
+          ./ssh-guest 'bash -se' < stock-settings.sh | tee evidence/after-gate.log
+          cmp evidence/after-gate.log evidence/before-install.log
+          cmp evidence/guest/baseline.log evidence/guest/baseline-after.log
+      - name: Redact disposable desktop passwords from suite logs
+        id: redact
+        if: always()
+        run: |
+          cd "$RUNNER_TEMP/stock-amd64/evidence"
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          logs = list(Path(".").rglob("*.log"))
+          passwords = {value for path in logs for value in
+                       re.findall(rb"(?im)^\s*password\s+([0-9a-f]{32})\s*$", path.read_bytes())}
+          for path in logs:
+              data = path.read_bytes()
+              for password in passwords:
+                  data = data.replace(password, b"[redacted]")
+              path.write_bytes(data)
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always() && steps.redact.outcome == 'success'
+        with:
+          name: stock-ubuntu-amd64-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/stock-amd64/evidence/
+          retention-days: 7
+          if-no-files-found: error
+      - name: Shut down the disposable guest
+        if: always()
+        run: |
+          if test -x "$RUNNER_TEMP/stock-amd64/ssh-guest"; then
+            "$RUNNER_TEMP/stock-amd64/ssh-guest" 'sudo -n systemctl poweroff' </dev/null || true
+          fi
