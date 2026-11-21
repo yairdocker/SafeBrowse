@@ -548,9 +548,11 @@ fault begins, and the next window is recording before the last one is stopped,
 so no packet falls between two windows. Each is stopped, copied out and decoded
 before its container is removed.
 
-The suite logs and counts confirmed inbound IPv6 router solicitations separately.
-Every other non-ARP packet must be WireGuard traffic between the VPN container
-and its peer. A regular window needs at least one tunnel packet. The *after
+The suite logs confirmed inbound IPv6 router solicitations and, only during
+peer recovery, confirmed inbound IPv4 ICMP port-unreachable replies from the
+peer. Both have separate counts. Every other non-ARP packet must be WireGuard
+traffic between the VPN container and its peer. A regular window needs at least
+one WireGuard packet even when it contains either kind of ICMP. The *after
 restart* window may be quiet. The positive control requires the observer to
 receive the deliberate request and the capture to reject traffic involving the
 observer's address.
@@ -564,6 +566,20 @@ checksum. The 8-byte solicitation carries no options. The 16-byte form carries
 one source link-layer address option that matches the Ethernet source. A
 link-local IPv6 source may use either form. An unspecified source must use the
 8-byte form.
+
+For a peer-recovery reply, the Ethernet source and destination must match the
+measured MAC addresses of the peer and VPN interfaces, respectively. The outer
+IPv4 packet must travel from the peer to the VPN container and carry ICMP
+destination unreachable, port unreachable (type 3, code 3). Its quote must
+contain an unfragmented IPv4 datagram header and a UDP header from the VPN
+address to the peer's WireGuard port `51820`. The suite checks the captured
+frame length, both IPv4 header checksums and the ICMP checksum.
+
+The hosted run at `138e312` captured two such replies while the peer was
+restarting. Each quoted an outbound UDP datagram to port `51820`. That run
+rejected both replies and passed its separate route-loss check.
+[Integration job](https://github.com/yairdocker/SafeBrowse/actions/runs/44872025116/job/136748452378) ·
+[Peer-recovery capture](https://github.com/yairdocker/SafeBrowse/actions/runs/44872025116/artifacts/14695015212)
 
 - Secret handling and resume, route restoration and peer recovery are checked
   in windows of their own. Peer recovery was captured before but never checked.
@@ -582,8 +598,8 @@ packets, saying how many more there are. Each packet is shown with its capture
 time, link-layer addresses, tcpdump's one-line summary and a direction. A
 direction is *measured* when the frame's link-layer source was compared with
 the interface's own address, *inferred* when only the fixture's IPv4 addresses
-were available, and otherwise *unknown*. Only measured inbound direction can
-qualify a router solicitation for separate logging. Packet contents are never
+were available, and otherwise *unknown*. Separate logging for either kind of
+ICMP requires measured inbound direction. Packet contents are never
 printed.
 
 To keep the evidence, name an empty directory outside the checkout:

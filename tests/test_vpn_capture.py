@@ -4,6 +4,7 @@ Nothing here starts a container or captures a packet: Docker is a scripted stand
 and the packets are hand-built Ethernet frames with the tcpdump lines that would describe them.
 """
 import io
+import ipaddress
 import json
 from pathlib import Path
 import re
@@ -323,9 +324,10 @@ class WindowTests(CaptureCase):
         self.assertEqual(self.files(), ["01-normal-operation/" + name for name in sorted(vpn_capture.WINDOW_FILES)] + ["run.json"])
         manifest = self.manifest("01-normal-operation")
         self.assertEqual(manifest["counts"], {"captured_packets": 2, "decoded_lines": 2, "inbound_router_solicitations": 0,
-                                               "rejected": 0, "rejected_by_direction": {}})
+                                               "inbound_peer_port_unreachables": 0, "rejected": 0, "rejected_by_direction": {}})
         self.assertEqual(manifest["status"]["verdict"], "accepted")
-        self.assertEqual(manifest["fixture"], {"vpn_address": VPN, "vpn_link_address": OWN, "peer_address": PEER, "wireguard_port": 51820})
+        self.assertEqual(manifest["fixture"], {"vpn_address": VPN, "vpn_link_address": OWN, "peer_address": PEER,
+                                               "peer_link_address": None, "wireguard_port": 51820})
         self.assertEqual((self.directory / "01-normal-operation/capture.pcap").read_bytes(), pcap([OUT_TUNNEL[0], IN_TUNNEL[0]]))
 
     def test_the_capture_and_decode_commands_are_the_ones_the_suite_always_used(self):
@@ -563,6 +565,133 @@ class WindowTests(CaptureCase):
         clean = capture.close(capture.open("positive control", expect=vpn_capture.DELIBERATE_LEAK))
         self.assertEqual((clean.rejected_lines(), clean.verdict, clean.as_expected()), ([], "accepted", False))
         self.assertEqual(manifest["counts"]["rejected_by_direction"], {"outbound (measured)": 14, "inbound (measured)": 1})
+
+
+def checksummed(data, offset):
+    """Fill a zero IPv4 or ICMP checksum field in the synthetic packet."""
+    padded = data + (b"\0" if len(data) % 2 else b"")
+    total = sum(word for word, in struct.iter_unpack("!H", padded))
+    while total >> 16:
+        total = (total & 0xffff) + (total >> 16)
+    return data[:offset] + struct.pack("!H", total ^ 0xffff) + data[offset + 2:]
+
+
+def ipv4(source, target, protocol, payload, fragment=0):
+    header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), 123, fragment, 64, protocol, 0,
+                         ipaddress.IPv4Address(source).packed, ipaddress.IPv4Address(target).packed)
+    return checksummed(header, 10) + payload
+
+
+def peer_unreachable(quote, source=PEER, target=VPN, message_type=3, code=3, reserved=0, fragment=0):
+    message = checksummed(struct.pack("!BBHI", message_type, code, 0, reserved) + quote, 2)
+    packet = frame(PEER_LINK, OWN, body=ipv4(source, target, 1, message, fragment))
+    line = f"00:04:11.000012 IP {source} > {target}: ICMP {PEER} udp port 51820 unreachable, length {len(message)}"
+    return packet, line
+
+
+class PeerRecoveryTests(CaptureCase):
+    # A UDP datagram to the fixture WireGuard port. The minimum ICMP quote includes just its UDP header.
+    udp = struct.pack("!4H", 43210, 51820, 11, 0) + b"abc"
+    original = ipv4(VPN, PEER, 17, udp)
+
+    def test_full_and_minimum_quotes_are_logged_separately_from_tunnel_and_solicitations(self):
+        replies = [peer_unreachable(self.original), peer_unreachable(self.original[:28])]
+        records = [OUT_TUNNEL, *replies, INBOUND_RS]
+        capture = self.capture(Docker({1: records}))
+        window = capture.open("peer recovery")
+        window.peer_mac = PEER_LINK
+        capture.check(window)
+        capture.finish()
+        manifest = self.manifest(window.name)
+        counts = manifest["counts"]
+        self.assertEqual((counts["captured_packets"], counts["inbound_peer_port_unreachables"],
+                          counts["inbound_router_solicitations"], counts["rejected"]), (4, 2, 1, 0))
+        self.assertEqual(manifest["fixture"]["peer_link_address"], PEER_LINK)
+        run = json.loads((self.directory / "run.json").read_text())
+        self.assertEqual((run["outcome"], run["windows"][0]["inbound_peer_port_unreachables"]), ("passed", 2))
+        folder = self.directory / window.name
+        self.assertEqual((folder / "capture.pcap").read_bytes(), pcap([packet for packet, _ in records]))
+        for _, summary in replies:
+            self.assertTrue(any(summary in line for line in self.printed("INFO")))
+            self.assertIn(summary, (folder / "decoded.txt").read_text())
+            self.assertNotIn(summary, (folder / "rejected.txt").read_text())
+
+    def test_informational_replies_neither_prove_tunnel_traffic_nor_hide_a_leak(self):
+        reply = peer_unreachable(self.original)
+        leak = UNMATCHED["outbound from the egress address"]
+        for records, rejected in (([reply, INBOUND_RS], []), ([OUT_TUNNEL, reply, leak], [leak[1]])):
+            with self.subTest(rejected=rejected):
+                capture = self.capture(Docker({1: records}), directory=None)
+                window = capture.open("peer recovery")
+                window.peer_mac = PEER_LINK
+                with self.assertRaises(RuntimeError):
+                    capture.check(window)
+                self.assertEqual(window.rejected_lines(), rejected)
+                self.assertEqual(window.verdict, "rejected")
+
+    def test_reply_is_rejected_outside_the_ordinary_peer_recovery_window(self):
+        reply = peer_unreachable(self.original)
+        for scenario, expect in (("peer outage", vpn_capture.TUNNEL_ONLY), ("route loss", vpn_capture.TUNNEL_ONLY),
+                                 ("after restart", vpn_capture.TUNNEL_ONLY), ("positive control", vpn_capture.DELIBERATE_LEAK),
+                                 ("peer recovery", vpn_capture.DELIBERATE_LEAK)):
+            with self.subTest(scenario=scenario, expect=expect):
+                capture = self.capture(Docker({1: [OUT_TUNNEL, reply]}), directory=None)
+                window = capture.open(scenario, expect=expect)
+                window.peer_mac = PEER_LINK
+                capture.close(window, quiet=scenario == "after restart")
+                self.assertEqual(window.rejected_lines(), [reply[1]])
+
+    def test_recovery_requires_both_measured_macs_and_consistent_decode(self):
+        packet, line = peer_unreachable(self.original)
+        for label, data, summary, peer_mac, settings in (
+                ("outbound", frame(OWN, PEER_LINK, body=packet[14:]), line, PEER_LINK, {}),
+                ("other sender", frame(OTHER_LINK, OWN, body=packet[14:]), line, PEER_LINK, {}),
+                ("other recipient", frame(PEER_LINK, OTHER_LINK, body=packet[14:]), line, PEER_LINK, {}),
+                ("no peer MAC", packet, line, None, {}),
+                ("no VPN MAC", packet, line, PEER_LINK, {"no_link_address": True}),
+                ("unknown link type", packet, line, PEER_LINK, {"capture": pcap([packet], linktype=113), "decoded": line.encode()}),
+                ("different decode", packet, line.replace("51820", "51821"), PEER_LINK, {}),
+                ("truncated", packet[:-1], line, PEER_LINK, {}),
+                ("extra frame data", packet + b"x", line, PEER_LINK, {})):
+            with self.subTest(label=label):
+                capture = self.capture(Docker({1: [(data, summary)]}, **settings), directory=None)
+                window = capture.open("peer recovery")
+                window.peer_mac = peer_mac
+                self.assertEqual(capture.close(window).rejected_lines(), [summary])
+
+    def test_recovery_rejects_wrong_or_malformed_icmp_and_quotes(self):
+        original = self.original
+        wrong_port = struct.pack("!4H", 43210, 51821, 11, 0) + b"abc"
+        zero_source = struct.pack("!4H", 0, 51820, 11, 0) + b"abc"
+        wrong_length = struct.pack("!4H", 43210, 51820, 12, 0) + b"abc"
+        invalid_checksum = original[:10] + bytes(2) + original[12:]
+        packet, line = peer_unreachable(original)
+        cases = {
+            "outer source": peer_unreachable(original, source=OBSERVER),
+            "outer target": peer_unreachable(original, target=OBSERVER),
+            "outer fragment": peer_unreachable(original, fragment=0x2000),
+            "outer IP checksum": (packet[:24] + bytes(2) + packet[26:], line),
+            "ICMP checksum": (packet[:36] + bytes(2) + packet[38:], line),
+            "ICMP type": peer_unreachable(original, message_type=11),
+            "ICMP code": peer_unreachable(original, code=1),
+            "ICMP reserved word": peer_unreachable(original, reserved=1),
+            "quoted source": peer_unreachable(ipv4(OBSERVER, PEER, 17, self.udp)),
+            "quoted target": peer_unreachable(ipv4(VPN, OBSERVER, 17, self.udp)),
+            "quoted protocol": peer_unreachable(ipv4(VPN, PEER, 6, self.udp)),
+            "quoted fragment": peer_unreachable(ipv4(VPN, PEER, 17, self.udp, fragment=1)),
+            "quoted IP checksum": peer_unreachable(invalid_checksum),
+            "incomplete UDP header": peer_unreachable(original[:27]),
+            "data beyond quoted packet": peer_unreachable(original + b"x"),
+            "quoted UDP destination": peer_unreachable(ipv4(VPN, PEER, 17, wrong_port)),
+            "quoted UDP source": peer_unreachable(ipv4(VPN, PEER, 17, zero_source)),
+            "quoted UDP length": peer_unreachable(ipv4(VPN, PEER, 17, wrong_length)),
+        }
+        for label, record in cases.items():
+            with self.subTest(label=label):
+                capture = self.capture(Docker({1: [record]}), directory=None)
+                window = capture.open("peer recovery")
+                window.peer_mac = PEER_LINK
+                self.assertEqual(capture.close(window).rejected_lines(), [record[1]])
 
 
 class CompletenessTests(CaptureCase):
@@ -952,6 +1081,7 @@ class SuiteWiringTests(unittest.TestCase):
                  'capture.check(window, then="interface removal and reconnect")', '"ip", "link", "del"',
                  'capture.check(window, then="peer outage")', '"docker", "stop", "--time", "1", project + "-peer"',
                  'capture.check(window, then="peer recovery")', '"docker", "start", project + "-peer"',
+                 'window.peer_mac = egress_endpoint("peer")',
                  "capture.check(window)\n", '"docker", "restart", "--time", "2", session.vpn',
                  'capture.open("after restart")', 'capture.open("positive control"', '"iptables", "-I", "OUTPUT"',
                  "capture.close(control)"]

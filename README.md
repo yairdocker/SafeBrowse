@@ -427,8 +427,10 @@ injects faults (route loss, interface removal, peer outage, container restart,
 stop/start and recreation) from a helper container and records every non-ARP
 packet on the VPN container's egress interface, in a separate capture for each
 scenario. The suite logs confirmed inbound IPv6 router solicitations separately.
-Every other non-ARP packet must be WireGuard traffic to or from the fixture
-peer. Each ordinary capture window requires tunnel traffic, except for the
+Only during peer recovery, it also logs inbound ICMP port-unreachable replies
+from the peer that quote UDP from the VPN container to the peer's WireGuard
+port. Every other non-ARP packet must be WireGuard traffic to or from the
+fixture peer. Each ordinary capture window requires tunnel traffic, except for the
 window after restart, which may be quiet. The positive control deliberately
 sends traffic outside the tunnel and checks that the capture rejects it.
 The suite can retain the raw captures and packet summaries. See

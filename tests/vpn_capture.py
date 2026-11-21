@@ -1,8 +1,9 @@
 """Packet-capture windows for tests/integration_vpn.py. Test-side only: nothing here ships.
 
 The VPN suite records every non-ARP packet on the VPN container's egress interface.
-It checks for WireGuard traffic to or from the fixture peer and logs confirmed
-inbound IPv6 router solicitations separately. The diagnostics include:
+It checks for WireGuard traffic to or from the fixture peer. Confirmed inbound
+IPv6 router solicitations and the recovering peer's verified ICMP port-unreachable
+replies are logged separately. The diagnostics include:
 
 * one capture per scenario ("window"), so a rejected packet belongs to a scenario;
 * the rejected tcpdump lines, each with its capture timestamp and a direction;
@@ -12,7 +13,7 @@ inbound IPv6 router solicitations separately. The diagnostics include:
 Direction is "measured" when the frame's link-layer source
 is compared with the interface's own address, "inferred" when only the fixture's
 IPv4 addresses are available, and otherwise "unknown". Only measured ingress can
-qualify a router solicitation for the informational log.
+qualify either kind of informational packet.
 
 A capture that is missing, unreadable, truncated or cannot be decoded raises
 CaptureError. So does one that tcpdump's own closing statistics do not show to
@@ -172,6 +173,14 @@ def direction(frame, linktype, own, line, vpn_ip):
     return "unknown", ""
 
 
+def checksum_valid(data):
+    """An Internet checksum including its checksum field must fold to all ones."""
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(word for word, in struct.iter_unpack("!H", data))
+    return total > 0 and total % 0xffff == 0
+
+
 def confirmed_inbound_solicitation(frame, linktype, own, line):
     """Recognise the plain Ethernet all-routers solicitation seen on the hosted bridge."""
     packet = frame.packet
@@ -196,7 +205,46 @@ def confirmed_inbound_solicitation(frame, linktype, own, line):
         return False
     # A valid ICMPv6 checksum folds to all ones over the pseudo-header and message.
     pseudo_header = packet[22:54] + struct.pack("!I3xB", len(icmp), 58)
-    return sum(word for word, in struct.iter_unpack("!H", pseudo_header + icmp)) % 0xffff == 0
+    return checksum_valid(pseudo_header + icmp)
+
+
+def plain_ipv4(packet, source, target, protocol):
+    """Match an unfragmented IPv4 header without options. Only the DF flag may be set."""
+    header = packet[:20]
+    return (len(header) == 20 and header[0] == 0x45 and header[6:8] in (b"\0\0", b"\x40\0")
+            and header[8] > 0 and header[9] == protocol and checksum_valid(header)
+            and str(ipaddress.IPv4Address(header[12:16])) == source
+            and str(ipaddress.IPv4Address(header[16:20])) == target)
+
+
+def confirmed_peer_port_unreachable(frame, linktype, own, peer_mac, vpn_ip, peer_ip, line):
+    """Confirm the peer's ICMPv4 error and the original VPN-to-peer UDP header it quotes."""
+    packet = frame.packet
+    # Ethernet + IPv4 + ICMP + quoted IPv4 and UDP headers, at minimum.
+    if linktype != ETHERNET or not own or not peer_mac or len(packet) != frame.length or len(packet) < 70:
+        return False
+    target, source = packet[:6], packet[6:12]
+    if (packet[12:14] != b"\x08\x00" or source == target or not any(source) or source[0] & 1
+            or not any(target) or target[0] & 1 or link_address(target) != own.lower()
+            or link_address(source) != peer_mac.lower()):
+        return False
+
+    outer = packet[14:]
+    if not plain_ipv4(outer, peer_ip, vpn_ip, 1) or int.from_bytes(outer[2:4], "big") != len(outer):
+        return False
+    icmp = outer[20:]
+    if icmp[:2] != b"\x03\x03" or any(icmp[4:8]) or not checksum_valid(icmp):
+        return False
+    quote = icmp[8:]
+    if not plain_ipv4(quote, vpn_ip, peer_ip, 17):
+        return False
+    original_length = int.from_bytes(quote[2:4], "big")
+    source_port, target_port, udp_length = struct.unpack_from("!HHH", quote, 20)
+    # An ICMP error may quote only the headers. The original IP and UDP lengths must still agree.
+    return (source_port != 0 and target_port == WIREGUARD_PORT and 28 <= len(quote) <= original_length
+            and original_length == 20 + udp_length
+            and line.endswith(f" IP {peer_ip} > {vpn_ip}: ICMP {peer_ip} udp port {WIREGUARD_PORT} "
+                              f"unreachable, length {len(icmp)}"))
 
 
 def describe(index, frame, linktype, own, line, vpn_ip):
@@ -211,7 +259,8 @@ def describe(index, frame, linktype, own, line, vpn_ip):
 
 LEGEND = ("direction: [measured] compares each frame's link-layer source with the interface's own address; [inferred] "
           "uses the fixture's IPv4 addresses because no link-layer measurement was available; otherwise unknown. "
-          "Only a verified router solicitation with measured inbound direction is informational.")
+          "Only verified inbound router solicitations and the recovering peer's verified inbound ICMP "
+          "port-unreachable replies are informational.")
 
 
 def slug(text):
@@ -295,7 +344,8 @@ class Window:
         self.requested = self.recording = self.stopped = None
         self.own = self.vpn_ip = self.pcap = self.linktype = self.problem = self.evidence = None
         self.frames, self.lines, self.rejected, self.summaries, self.files = [], [], [], [], []
-        self.solicitations = []
+        self.solicitations, self.peer_unreachables = [], []
+        self.peer_mac = None
         self.statistics, self.quiet = {}, False
         self.capture, self.decoding, self.verdict = "not started", "not attempted", "not checked"
 
@@ -377,7 +427,7 @@ class Capture:
         window.quiet = quiet
         try:
             self._collect(window)
-            eligible = len(window.lines) - len(window.solicitations)
+            eligible = len(window.lines) - len(window.solicitations) - len(window.peer_unreachables)
             window.verdict = "accepted" if acceptable(eligible, window.rejected, quiet) else "rejected"
         except CaptureError as error:
             window.problem = str(error)
@@ -388,7 +438,7 @@ class Capture:
         return window
 
     def check(self, window, quiet=False, then=None):
-        """Check tunnel traffic, accounting separately for confirmed incoming router solicitations.
+        """Check tunnel traffic, accounting separately for confirmed inbound control packets.
 
         `then` names the next window. It is opened, and recording, before this one is stopped, so no packet
         falls between two windows.
@@ -397,10 +447,11 @@ class Capture:
         self.close(window, quiet)
         total = len(window.lines)
         message = f"{window.scenario}: all {total} packets on the egress interface were WireGuard to or from the peer"
-        if window.solicitations:
-            tunnel = total - len(window.solicitations) - len(window.rejected)
+        if window.solicitations or window.peer_unreachables:
+            tunnel = total - len(window.solicitations) - len(window.peer_unreachables) - len(window.rejected)
             message = (f"{window.scenario}: {tunnel} WireGuard packets, {len(window.solicitations)} confirmed inbound "
-                       f"router solicitations, {len(window.rejected)} rejected")
+                       f"router solicitations, {len(window.peer_unreachables)} confirmed inbound peer port-unreachables, "
+                       f"{len(window.rejected)} rejected")
         if window.verdict != "accepted":
             raise RuntimeError(message)
         self.emit(f"PASS  {message}")
@@ -550,16 +601,24 @@ class Capture:
                             for index, (frame, line) in enumerate(zip(window.frames, window.lines))]
         unexpected = []
         for index in window.rejected:
-            if confirmed_inbound_solicitation(window.frames[index], window.linktype, window.own, window.lines[index]):
+            frame, line = window.frames[index], window.lines[index]
+            if confirmed_inbound_solicitation(frame, window.linktype, window.own, line):
                 window.solicitations.append(index)
                 window.summaries[index] += " [confirmed inbound router solicitation]"
+            elif (window.scenario == "peer recovery" and window.expect == TUNNEL_ONLY
+                  and confirmed_peer_port_unreachable(frame, window.linktype, window.own, window.peer_mac,
+                                                      window.vpn_ip, self.peer_ip, line)):
+                window.peer_unreachables.append(index)
+                window.summaries[index] += " [confirmed inbound peer port-unreachable]"
             else:
                 unexpected.append(index)
         window.rejected = unexpected
-        for index in window.solicitations[:CONSOLE_LIMIT]:
-            self.emit(f"INFO  {window.name}: {shown(window.summaries[index])}")
-        if len(window.solicitations) > CONSOLE_LIMIT:
-            self.emit(f"INFO  {window.name}: {len(window.solicitations) - CONSOLE_LIMIT} additional inbound router solicitations")
+        for indices, label in ((window.solicitations, "router solicitations"),
+                               (window.peer_unreachables, "peer port-unreachables")):
+            for index in indices[:CONSOLE_LIMIT]:
+                self.emit(f"INFO  {window.name}: {shown(window.summaries[index])}")
+            if len(indices) > CONSOLE_LIMIT:
+                self.emit(f"INFO  {window.name}: {len(indices) - CONSOLE_LIMIT} additional inbound {label}")
         window.decoding = "complete"
 
     def _settle(self, window, announce=False):
@@ -592,10 +651,11 @@ class Capture:
                       "first_packet": stamp(window.frames[0]) if window.frames else None,
                       "last_packet": stamp(window.frames[-1]) if window.frames else None},
             "fixture": {"vpn_address": window.vpn_ip, "vpn_link_address": window.own, "peer_address": self.peer_ip,
-                        "wireguard_port": WIREGUARD_PORT},
+                        "peer_link_address": window.peer_mac, "wireguard_port": WIREGUARD_PORT},
             "counts": {"captured_packets": len(window.frames) if window.pcap is not None else None,
                        "decoded_lines": len(window.lines) if window.decoding != "not attempted" else None,
                        "inbound_router_solicitations": len(window.solicitations) if window.decoding == "complete" else None,
+                       "inbound_peer_port_unreachables": len(window.peer_unreachables) if window.decoding == "complete" else None,
                        "rejected": len(window.rejected) if window.decoding != "not attempted" else None,
                        "rejected_by_direction": directions},
             "tcpdump_statistics": window.statistics,
@@ -670,7 +730,8 @@ class Capture:
                 "windows": [{"window": w.name, "scenario": w.scenario, "expectation": w.expect, "capture": w.capture,
                              "decoding": w.decoding, "verdict": w.verdict, "as_expected": w.as_expected(),
                              "packets": len(w.frames), "rejected": len(w.rejected),
-                             "inbound_router_solicitations": len(w.solicitations) if w.decoding == "complete" else None}
+                             "inbound_router_solicitations": len(w.solicitations) if w.decoding == "complete" else None,
+                             "inbound_peer_port_unreachables": len(w.peer_unreachables) if w.decoding == "complete" else None}
                             for w in self.windows],
                 "failure_state": self.state, "export_errors": self.export_errors}, indent=2) + "\n")
         except (OSError, CaptureError) as error:
