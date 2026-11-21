@@ -14,10 +14,11 @@ they were measured in the environment named in [Observed results](#observed-resu
 | VPN mode against a real Mullvad server | **NOT VERIFIED** |
 | VPN mode on GitHub-hosted Ubuntu 24.04 (x86_64), against a controlled peer | All 162 VPN checks passed on 21 November 2026. [Hosted evidence](#on-a-github-hosted-linux-runner) |
 | VPN mode on stock Ubuntu 24.04 arm64, against a controlled peer | All 162 VPN checks passed on 21 November 2026. [Stock-host evidence](#on-stock-ubuntu-2404-arm64) |
+| VPN mode on stock Ubuntu 24.04 x86_64, against a controlled peer | All 162 VPN checks passed on 22 November 2026 (Melbourne). [Stock x86_64 evidence](#on-stock-ubuntu-2404-x86_64) |
 | Direct mode | unchanged; still the default |
 
-The tested stock Ubuntu 24.04 arm64 configuration passed the native Linux
-release gate. [Host baseline and suite results](LINUX_SECURITY.md#stock-ubuntu-2404-arm64)
+The tested stock Ubuntu 24.04 arm64 and x86_64 configurations passed the native
+Linux release gate. [Host baselines and suite results](LINUX_SECURITY.md#release-gate-for-native-linux)
 
 ## What it is, and what it is not
 
@@ -169,7 +170,7 @@ the file but was rejected: with it, Docker's default seccomp profile permits
 `open_by_handle_at`, a known way to reach host files.
 
 The launcher requires kernel WireGuard support. The tunnel came up in Docker
-Desktop's VM, on the hosted Ubuntu runner and on stock Ubuntu arm64. The failure
+Desktop's VM, on the hosted Ubuntu runner and on both stock Ubuntu architectures. The failure
 path on a kernel without WireGuard remains unverified on native Linux.
 
 ## The pinned image
@@ -268,7 +269,7 @@ request for an IPv6 destination fails and no packet leaves.
   `gateway`. In both modes the browser is created with `dns: 127.0.0.1`, which
   makes its own loopback address the only server that resolver may pass any
   other name on to. On Docker Desktop (Engine 29.9.2), hosted Ubuntu (28.0.4)
-  and stock Ubuntu arm64 (29.1.3), `gateway` resolved, Docker's resolver refused
+  and stock Ubuntu arm64 and x86_64 (29.1.3), `gateway` resolved, Docker's resolver refused
   external names, and the capture saw no browser DNS packets outside loopback. A control container
   on the same internal network, given a resolver on that network, forwarded
   its queries there. `./verify.sh` checks the restriction and the behaviour
@@ -538,6 +539,25 @@ inbound router solicitations across those windows. In the deliberate-leak
 control, the observer received the request and the capture check rejected all
 12 packets.
 
+### On stock Ubuntu 24.04 x86_64
+
+Commit `1b6329e` passed all 162 controlled-peer VPN checks in one run on stock
+Ubuntu Server 24.04.5 x86_64 in a KVM guest. The launcher used its standard
+timeouts and the guest's default `0002` umask. [Host baseline and suite results](LINUX_SECURITY.md#stock-ubuntu-2404-x86_64) · [Workflow run 44922273486](https://github.com/yairdocker/SafeBrowse/actions/runs/44922273486)
+
+During route loss the kernel selected ordinary egress, the firewall's output
+DROP counter rose and no new requests reached the destination. The `03-route-loss`
+capture on `egr0` recorded 25 non-ARP packets. All 10 outbound packets went
+to the WireGuard peer and all 15 inbound packets came from it. The capture
+reported zero rejected packets and zero kernel drops. New connections succeeded
+after route restoration.
+
+All eight ordinary capture windows passed. In the deliberate-leak control the
+observer received the request and the capture check rejected all 11 packets.
+The route-loss pcap has SHA-256
+`7379d793e03696083cda6edbafcb4824c8ebb652169cadb3e9df43a59f078131`.
+[Raw captures and manifests](https://github.com/yairdocker/SafeBrowse/actions/runs/44922273486/artifacts/14714592739)
+
 ### Capture diagnostics
 
 `tests/integration_vpn.py` keeps a separate capture, a *window*, for each
@@ -644,14 +664,14 @@ before that copy failed as it should.
 ## Not verified
 
 - A real Mullvad account, server or exported file. No account was created or used.
-- VPN operation on stock Ubuntu x86_64 or other untested native Linux hosts,
+- VPN operation on native Linux hosts outside the tested configurations,
   including kernel WireGuard availability and Gluetun's ability to read the
   mode-0600 configuration through a bind mount.
 - Docker's embedded-resolver behaviour, including how it treats `dns: 127.0.0.1`,
   outside the tested Engine 29.9.2 (Docker Desktop), 28.0.4 (hosted Ubuntu)
-  and 29.1.3 (stock Ubuntu arm64) configurations.
+  and 29.1.3 (stock Ubuntu arm64 and x86_64) configurations.
 - Storage ownership and permission checks on hosts outside macOS, hosted
-  Ubuntu x86_64 and stock Ubuntu arm64. The fallback for systems without
+  Ubuntu x86_64 and stock Ubuntu arm64 and x86_64. The fallback for systems without
   directory-relative file operations has only been exercised in simulation.
 - `--fresh` after a real checkout rename, and the reporting of generated
   configuration kept after a failed launch. Both were exercised offline against
