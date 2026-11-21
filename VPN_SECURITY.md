@@ -13,12 +13,11 @@ they were measured in the environment named in [Observed results](#observed-resu
 | VPN mode on macOS + Docker Desktop, against a controlled WireGuard peer | observed |
 | VPN mode against a real Mullvad server | **NOT VERIFIED** |
 | VPN mode on GitHub-hosted Ubuntu 24.04 (x86_64), against a controlled peer | All 162 VPN checks passed on 21 November 2026. [Hosted evidence](#on-a-github-hosted-linux-runner) |
-| VPN mode on a stock Ubuntu 24.04 installation or another native Linux host outside GitHub Actions | **NOT VERIFIED** |
+| VPN mode on stock Ubuntu 24.04 arm64, against a controlled peer | All 162 VPN checks passed on 21 November 2026. [Stock-host evidence](#on-stock-ubuntu-2404-arm64) |
 | Direct mode | unchanged; still the default |
 
-**Native Linux remains experimental** until the release gate passes on stock
-Ubuntu 24.04. Validating VPN mode there also requires running the controlled-peer
-VPN suite on that host. [Native Linux release gate](LINUX_SECURITY.md#release-gate-for-native-linux)
+The tested stock Ubuntu 24.04 arm64 configuration passed the native Linux
+release gate. [Host baseline and suite results](LINUX_SECURITY.md#stock-ubuntu-2404-arm64)
 
 ## What it is, and what it is not
 
@@ -161,7 +160,7 @@ In VPN mode:
 | Granted | Why | Evidence |
 |---|---|---|
 | `NET_ADMIN` | Create the WireGuard interface, routes and firewall rules in its own namespace. | Gluetun starts and connects with this alone on Docker Desktop. |
-| `DAC_OVERRIDE` | Read the user-owned configuration file with mode 0600. | On a volume inside the Docker Desktop VM, a root process with only `NET_ADMIN` received `Permission denied`. Adding `DAC_OVERRIDE` allowed the read. Docker Desktop presents host bind mounts as root-owned. On hosted Ubuntu, Gluetun read the bind-mounted 0600 file with exactly the two listed capabilities. Removing `DAC_OVERRIDE` on that host remains untested. |
+| `DAC_OVERRIDE` | Read the user-owned configuration file with mode 0600. | On a volume inside the Docker Desktop VM, a root process with only `NET_ADMIN` received `Permission denied`. Adding `DAC_OVERRIDE` allowed the read. Docker Desktop presents host bind mounts as root-owned. On hosted and stock Ubuntu, Gluetun read the bind-mounted 0600 file with the two listed capabilities. Removing `DAC_OVERRIDE` on those hosts remains untested. |
 
 Not granted: `privileged`, `SYS_ADMIN`, `SYS_MODULE`, `NET_RAW`, any device
 (kernel WireGuard needs no `/dev/net/tun`; the userspace fallback is not
@@ -170,8 +169,8 @@ the file but was rejected: with it, Docker's default seccomp profile permits
 `open_by_handle_at`, a known way to reach host files.
 
 The launcher requires kernel WireGuard support. The tunnel came up in Docker
-Desktop's VM and on the hosted Ubuntu runner. The failure path on a kernel
-without WireGuard remains unverified on native Linux.
+Desktop's VM, on the hosted Ubuntu runner and on stock Ubuntu arm64. The failure
+path on a kernel without WireGuard remains unverified on native Linux.
 
 ## The pinned image
 
@@ -268,9 +267,9 @@ request for an IPv6 destination fails and no packet leaves.
 - **The browser container's resolver** is Docker's embedded one, needed to find
   `gateway`. In both modes the browser is created with `dns: 127.0.0.1`, which
   makes its own loopback address the only server that resolver may pass any
-  other name on to. On Docker Desktop Engine 29.9.2 and hosted Ubuntu Engine
-  28.0.4, `gateway` resolved, Docker's resolver refused external names, and the
-  capture saw no browser DNS packets outside loopback. A control container
+  other name on to. On Docker Desktop (Engine 29.9.2), hosted Ubuntu (28.0.4)
+  and stock Ubuntu arm64 (29.1.3), `gateway` resolved, Docker's resolver refused
+  external names, and the capture saw no browser DNS packets outside loopback. A control container
   on the same internal network, given a resolver on that network, forwarded
   its queries there. `./verify.sh` checks the restriction and the behaviour
   separately and passes only when it confirms both. Other Engine versions
@@ -521,6 +520,24 @@ rejected traffic remain unknown. Subsequent runs captured inbound router
 solicitations, but the original failure cannot be attributed to them.
 [Earlier run 43333272449](https://github.com/yairdocker/SafeBrowse/actions/runs/43333272449)
 
+### On stock Ubuntu 24.04 arm64
+
+On 21 November 2026, all 162 controlled-peer VPN checks passed on stock Ubuntu
+24.04.5 arm64 with Docker Engine 29.1.3 and the default `0002` umask.
+[Host baseline and suite results](LINUX_SECURITY.md#stock-ubuntu-2404-arm64)
+
+After the tunnel route was removed, the kernel selected ordinary egress, the
+firewall's output DROP counter rose and no new requests reached the destination.
+The `03-route-loss` capture on `egr0` contained 34 non-ARP packets. All 14
+outbound packets went to the WireGuard peer. The 20 inbound packets comprised
+19 WireGuard packets from the peer and one IPv6 router solicitation. The
+capture reported zero kernel drops.
+
+All eight ordinary capture windows passed. The suite logged three confirmed
+inbound router solicitations across those windows. In the deliberate-leak
+control, the observer received the request and the capture check rejected all
+12 packets.
+
 ### Capture diagnostics
 
 `tests/integration_vpn.py` keeps a separate capture, a *window*, for each
@@ -531,9 +548,11 @@ fault begins, and the next window is recording before the last one is stopped,
 so no packet falls between two windows. Each is stopped, copied out and decoded
 before its container is removed.
 
-The suite logs and counts confirmed inbound IPv6 router solicitations separately.
-Every other non-ARP packet must be WireGuard traffic between the VPN container
-and its peer. A regular window needs at least one tunnel packet. The *after
+The suite logs confirmed inbound IPv6 router solicitations and, only during
+peer recovery, confirmed inbound IPv4 ICMP port-unreachable replies from the
+peer. Both have separate counts. Every other non-ARP packet must be WireGuard
+traffic between the VPN container and its peer. A regular window needs at least
+one WireGuard packet even when it contains either kind of ICMP. The *after
 restart* window may be quiet. The positive control requires the observer to
 receive the deliberate request and the capture to reject traffic involving the
 observer's address.
@@ -547,6 +566,20 @@ checksum. The 8-byte solicitation carries no options. The 16-byte form carries
 one source link-layer address option that matches the Ethernet source. A
 link-local IPv6 source may use either form. An unspecified source must use the
 8-byte form.
+
+For a peer-recovery reply, the Ethernet source and destination must match the
+measured MAC addresses of the peer and VPN interfaces, respectively. The outer
+IPv4 packet must travel from the peer to the VPN container and carry ICMP
+destination unreachable, port unreachable (type 3, code 3). Its quote must
+contain an unfragmented IPv4 datagram header and a UDP header from the VPN
+address to the peer's WireGuard port `51820`. The suite checks the captured
+frame length, both IPv4 header checksums and the ICMP checksum.
+
+The hosted run at `138e312` captured two such replies while the peer was
+restarting. Each quoted an outbound UDP datagram to port `51820`. That run
+rejected both replies and passed its separate route-loss check.
+[Integration job](https://github.com/yairdocker/SafeBrowse/actions/runs/44872025116/job/136748452378) ·
+[Peer-recovery capture](https://github.com/yairdocker/SafeBrowse/actions/runs/44872025116/artifacts/14695015212)
 
 - Secret handling and resume, route restoration and peer recovery are checked
   in windows of their own. Peer recovery was captured before but never checked.
@@ -565,8 +598,8 @@ packets, saying how many more there are. Each packet is shown with its capture
 time, link-layer addresses, tcpdump's one-line summary and a direction. A
 direction is *measured* when the frame's link-layer source was compared with
 the interface's own address, *inferred* when only the fixture's IPv4 addresses
-were available, and otherwise *unknown*. Only measured inbound direction can
-qualify a router solicitation for separate logging. Packet contents are never
+were available, and otherwise *unknown*. Separate logging for either kind of
+ICMP requires measured inbound direction. Packet contents are never
 printed.
 
 To keep the evidence, name an empty directory outside the checkout:
@@ -611,15 +644,15 @@ before that copy failed as it should.
 ## Not verified
 
 - A real Mullvad account, server or exported file. No account was created or used.
-- VPN operation on a stock Ubuntu 24.04 installation or another native Linux
-  host outside GitHub Actions, including kernel WireGuard availability and
-  Gluetun's ability to read the mode-0600 configuration through a bind mount.
+- VPN operation on stock Ubuntu x86_64 or other untested native Linux hosts,
+  including kernel WireGuard availability and Gluetun's ability to read the
+  mode-0600 configuration through a bind mount.
 - Docker's embedded-resolver behaviour, including how it treats `dns: 127.0.0.1`,
-  outside the tested Engine 29.9.2 (Docker Desktop) and 28.0.4 (hosted Ubuntu)
-  configurations.
-- Storage ownership and permission checks on hosts outside macOS and hosted
-  Ubuntu. The fallback for systems without directory-relative file operations
-  has only been exercised in simulation.
+  outside the tested Engine 29.9.2 (Docker Desktop), 28.0.4 (hosted Ubuntu)
+  and 29.1.3 (stock Ubuntu arm64) configurations.
+- Storage ownership and permission checks on hosts outside macOS, hosted
+  Ubuntu x86_64 and stock Ubuntu arm64. The fallback for systems without
+  directory-relative file operations has only been exercised in simulation.
 - `--fresh` after a real checkout rename, and the reporting of generated
   configuration kept after a failed launch. Both were exercised offline against
   a simulated Docker only.

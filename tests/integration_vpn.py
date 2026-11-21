@@ -238,14 +238,14 @@ def main():
     def binary(*arguments, input=None, timeout=60):
         return subprocess.run(arguments, env=env, input=input, capture_output=True, timeout=timeout)
 
-    def egress_address():
+    def egress_endpoint(role):
         return json.loads(command("docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}",
-                                  project + "-vpn", env=env).stdout)[project + "_egress"]["IPAddress"]
+                                  project + "-" + role, env=env).stdout)[project + "_egress"]
 
     # Every non-ARP packet on the VPN container's egress interface, one named window per scenario. A window is
-    # checked for tunnel traffic, with confirmed inbound router solicitations logged separately.
+    # checked for tunnel traffic, with verified inbound control packets logged separately.
     capture = vpn_capture.Capture(binary, project, project + "-vpn", peer_image, vpn.EGRESS_INTERFACE, peer_ip,
-                                  egress_address, directory=evidence)
+                                  lambda: egress_endpoint("vpn")["IPAddress"], directory=evidence)
 
     with capture.record(), tempfile.TemporaryDirectory(prefix=project + "-") as directory:
         fixture = Path(directory).resolve()
@@ -682,6 +682,8 @@ def main():
             window = capture.check(window, then="peer recovery")
             require(not observed(), "peer outage: nothing reached the egress-bridge observer")
             command("docker", "start", project + "-peer", env=env)
+            # Docker can assign a new MAC when it reconnects the stopped peer to the bridge.
+            window.peer_mac = egress_endpoint("peer").get("MacAddress")
             wait_for("peer back: the tunnel reconnects without any container being restarted",
                      lambda: proxied(f"http://{WEB}/peer-back") == "200", 180)
             require({role: value for role, value in identities().items()} == original,
