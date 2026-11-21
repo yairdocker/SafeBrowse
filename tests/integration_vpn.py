@@ -48,6 +48,7 @@ from cli_integration import LOAD, OPEN_DRIVER, replace_line, snapshot, unused_su
 import safebrowse  # noqa: E402
 import verify  # noqa: E402
 import vpn  # noqa: E402
+import vpn_capture  # noqa: E402
 
 PRODUCTION = safebrowse.Session()
 WEB, NAMED = "203.0.113.10", "203.0.113.11"          # exist only inside the peer, behind the tunnel
@@ -212,6 +213,8 @@ def default_route(env):
 def main():
     env = {k: v for k, v in os.environ.items() if not k.startswith("COMPOSE_") and k not in safebrowse.OWNED
            and k not in ("SANDBOX_USER", "SANDBOX_PASSWORD")}
+    # Optional and test-only: where each capture window's pcap, summaries and manifest are kept.
+    evidence = vpn_capture.destination(os.environ.get(vpn_capture.VARIABLE), outside=(ROOT,))
     major = int(command("docker", "version", "--format", "{{.Server.Version}}", env=env).stdout.split(".")[0])
     require(major >= 28, "Docker Engine supports isolated bridge mode and named interfaces (28+)")
     gluetun = verify.pin.inventory(ROOT)[0]["qmcgaw/gluetun"]
@@ -232,7 +235,19 @@ def main():
     route_before = default_route(env)
     print(f"INFO  this computer's default route: {route_before}", flush=True)
 
-    with tempfile.TemporaryDirectory(prefix=project + "-") as directory:
+    def binary(*arguments, input=None, timeout=60):
+        return subprocess.run(arguments, env=env, input=input, capture_output=True, timeout=timeout)
+
+    def egress_address():
+        return json.loads(command("docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}",
+                                  project + "-vpn", env=env).stdout)[project + "_egress"]["IPAddress"]
+
+    # Every non-ARP packet on the VPN container's egress interface, one named window per scenario. A window is
+    # checked for tunnel traffic, with confirmed inbound router solicitations logged separately.
+    capture = vpn_capture.Capture(binary, project, project + "-vpn", peer_image, vpn.EGRESS_INTERFACE, peer_ip,
+                                  egress_address, directory=evidence)
+
+    with capture.record(), tempfile.TemporaryDirectory(prefix=project + "-") as directory:
         fixture = Path(directory).resolve()
         os.chmod(fixture, 0o755)  # bind-mounted fixture files must be readable inside containers
         for folder in ("policies", "gateway", "scripts", "security", "user"):
@@ -376,6 +391,7 @@ def main():
             client_key, peer_key, wrong_key = wg("genkey"), wg("genkey"), wg("genkey")
             client_public, peer_public = wg("pubkey", input=client_key), wg("pubkey", input=peer_key)
             keys = [client_key, peer_key, client_key[:3] + "..." + client_key[-3:]]
+            capture.secrets.extend(keys)  # no diagnostic artifact or message may contain them
             (fixture / "peer.conf").write_text(f"[Interface]\nPrivateKey = {peer_key}\nListenPort = 51820\n\n"
                                                f"[Peer]\nPublicKey = {client_public}\nAllowedIPs = {TUNNEL_CLIENT}/32\n")
             (fixture / "peer.json").write_text(json.dumps({
@@ -449,34 +465,6 @@ def main():
                 listing = command("docker", "exec", session.vpn, "iptables", "-L", "SAFEBROWSE_OUTPUT", "-v", "-n", "-x",
                                   env=env).stdout.splitlines()
                 return int([line for line in listing if " DROP " in line][-1].split()[0])
-
-            sniffer = project + "-sniff"
-
-            def capture_start():
-                command("docker", "rm", "--force", sniffer, env=env, check=False)
-                command("docker", "run", "--detach", "--name", sniffer, "--network", "container:" + session.vpn,
-                        "--cap-drop", "ALL", "--cap-add", "NET_RAW", "--cap-add", "NET_ADMIN", "--user", "0",
-                        "--entrypoint", "tcpdump", peer_image, "-Z", "root", "-i", vpn.EGRESS_INTERFACE, "-nn", "-U",
-                        "-w", "/tmp/egress.pcap", "not", "arp", env=env)
-                wait_for("packet capture on the VPN container's egress interface is running", lambda: command(
-                    "docker", "exec", sniffer, "test", "-s", "/tmp/egress.pcap", env=env, check=False).returncode == 0, 20)
-
-            def captured():
-                """Every non-ARP packet seen on the egress interface since capture_start, minus WireGuard."""
-                time.sleep(1)
-                text = command("docker", "exec", sniffer, "tcpdump", "-Z", "root", "-nn", "-q", "-r", "/tmp/egress.pcap",
-                               env=env).stdout
-                vpn_ip = json.loads(command("docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}",
-                                            session.vpn, env=env).stdout)[session.egress]["IPAddress"]
-                tunnel = re.compile(rf"IP ({re.escape(vpn_ip)}\.\d+ > {re.escape(peer_ip)}\.51820|"
-                                    rf"{re.escape(peer_ip)}\.51820 > {re.escape(vpn_ip)}\.\d+): UDP")
-                lines = [line for line in text.splitlines() if line.strip()]
-                return len(lines), [line for line in lines if not tunnel.search(line)]
-
-            def only_tunnel_traffic(description, quiet=False):
-                total, other = captured()
-                require((total > 0 or quiet) and not other, f"{description}: all {total} packets on the egress interface "
-                                                           "were WireGuard to or from the peer")
 
             def own_rules(text=None):
                 """Policies, SafeBrowse's chains and the first rule of each built-in chain."""
@@ -559,7 +547,7 @@ def main():
             require(" FAIL " not in output and "INCONCLUSIVE  " not in output, "no check failed or was inconclusive")
             original = identities()
             require(len(original) == 4 and all(v.endswith(" true") for v in original.values()), "all four containers run")
-            capture_start()
+            window = capture.open("normal operation")
             wait_for("Firefox loads the requested page through the tunnel", lambda: any(
                 r["path"] == first and "Firefox/" in r["agent"] and r["client"] == TUNNEL_CLIENT
                 for r in log_of(project + "-peer", "requests")), 30)
@@ -595,7 +583,7 @@ def main():
                              f"nslookup -timeout=3 example.com {vpn.DOCKER_RESOLVER} >/dev/null 2>&1; echo $?", env=env)
             require(inside.stdout.strip() != "0", "Docker's resolver inside the VPN namespace cannot be used to resolve "
                                                   "external names outside the tunnel")
-            only_tunnel_traffic("normal operation")
+            window = capture.check(window, then="secret handling and resume")
 
             print("\nSecret handling...", flush=True)
             current = generated()
@@ -648,6 +636,7 @@ def main():
             # ------------------------------------------------------------------ tunnel failures in a live namespace
             print("\nFailures inside the running session (fixture-only fault injection)...", flush=True)
             baseline_rules = rules()
+            window = capture.check(window, then="route loss")
             command("docker", "exec", "--detach", "--user", "1000:1000", session.browser, "sh", "-c",
                     f"curl --disable --silent --no-buffer --max-time 90 --noproxy '' --proxy http://gateway:3128 "
                     f"http://{WEB}/stream > /tmp/stream.txt 2>/dev/null", env=env)
@@ -657,6 +646,7 @@ def main():
                                    check=False).stdout.strip() or 0)
             wait_for("an established connection is carrying data", lambda: stream_lines() >= 3, 30)
             before = dropped()
+            print("INFO  removing the fixture's tunnel default route", flush=True)
             in_namespace("ip", "route", "del", "default", "dev", vpn.TUNNEL_INTERFACE, "table", "51820")
             route = command("docker", "exec", session.vpn, "ip", "-4", "route", "get", WEB, env=env).stdout
             require(f"dev {vpn.EGRESS_INTERFACE}" in route, "route loss: the kernel now selects the ordinary egress route")
@@ -667,12 +657,13 @@ def main():
                     "route loss: the new requests never arrive anywhere")
             require(dropped() > before, "route loss: the firewall's DROP rule counted the packets, from the established "
                                         "connection and the new ones, that the kernel sent towards the ordinary route")
-            only_tunnel_traffic("route loss")
+            window = capture.check(window, then="route restoration")
             require(rules() == baseline_rules, "route loss: the firewall rules are unchanged")
             print(f"INFO  established connection had delivered {stream_lines()} chunks; inbound data already in the tunnel "
                   "may still arrive, nothing goes out", flush=True)
             in_namespace("ip", "route", "add", "default", "dev", vpn.TUNNEL_INTERFACE, "table", "51820")
             wait_for("route restored: new connections work again", lambda: proxied(f"http://{WEB}/route-restored") == "200", 30)
+            window = capture.check(window, then="interface removal and reconnect")
 
             before = dropped()
             in_namespace("ip", "link", "del", vpn.TUNNEL_INTERFACE)
@@ -682,13 +673,13 @@ def main():
             require(own_rules() == own_rules(baseline_rules),
                     "interface removal and reconnect: SafeBrowse's chains are unchanged and still evaluated first")
             print(f"INFO  request sent while the interface was absent returned {first_try}", flush=True)
-            only_tunnel_traffic("interface removal and reconnect")
+            window = capture.check(window, then="peer outage")
 
             before = dropped()
             command("docker", "stop", "--time", "1", project + "-peer", env=env)
             require(proxied(f"http://{WEB}/peer-down", 4) != "200" and proxied("http://web.safebrowse.test/peer-down-name", 4) != "200",
                     "peer outage: new connections fail")
-            only_tunnel_traffic("peer outage")
+            window = capture.check(window, then="peer recovery")
             require(not observed(), "peer outage: nothing reached the egress-bridge observer")
             command("docker", "start", project + "-peer", env=env)
             wait_for("peer back: the tunnel reconnects without any container being restarted",
@@ -697,14 +688,15 @@ def main():
                     "tunnel recovery restarted and recreated no session container")
             code, output = verify_now()
             require(code == 0, "the recovered session passes full verification")
+            capture.check(window)
 
             # ------------------------------------------------------------------ VPN container restart
+            # The restart replaces the namespace, so no capture can span it: the next window starts once it exists.
             print("\nVPN container restart...", flush=True)
-            command("docker", "rm", "--force", sniffer, env=env, check=False)
             command("docker", "restart", "--time", "2", session.vpn, env=env)
             wait_for("restarted VPN container is healthy again", lambda: command(
                 "docker", "inspect", "--format", "{{.State.Health.Status}}", session.vpn, env=env).stdout.strip() == "healthy", 120)
-            capture_start()
+            window = capture.open("after restart")
             require(own_rules() == own_rules(baseline_rules), "restart: the rebuilt firewall has the same SafeBrowse chains, first")
             require(proxied(f"http://{WEB}/after-restart", 4) != "200" and "/after-restart" not in peer_paths(),
                     "restart: the gateway is in the old, empty namespace, so browsing fails closed")
@@ -714,7 +706,7 @@ def main():
             restarted = identities()
             code, output = cli("run", "--resume")
             require(code == 1 and identities() == restarted, "restart: resume refuses and repairs nothing")
-            only_tunnel_traffic("after restart", quiet=True)
+            capture.check(window, quiet=True)
             code, output = cli("run", "--fresh")
             fresh = identities()
             require(code == 0 and "VPN: the gateway's only route out" in output
@@ -818,19 +810,18 @@ def main():
 
             # ------------------------------------------------------------------ the capture can see a leak
             print("\nPositive control: with the firewall opened by hand, the ordinary route is observable...", flush=True)
-            capture_start()
+            control = capture.open("positive control", expect=vpn_capture.DELIBERATE_LEAK)
             before = len(observed())
             in_namespace("iptables", "-I", "OUTPUT", "1", "-d", observer_ip, "-j", "ACCEPT")
             in_namespace("iptables", "-I", "INPUT", "1", "-s", observer_ip, "-j", "ACCEPT")
             in_namespace("python3", "-c", "import urllib.request,sys; urllib.request.urlopen('http://%s/control' % sys.argv[1], timeout=5)",
                          observer_ip)
-            total, other = captured()
+            other = capture.close(control).rejected_lines()
             require("/control" in observed()[before:] and any(observer_ip in line for line in other),
                     "once rules are opened by hand, both the observer and the capture see traffic on the ordinary route")
 
             # ------------------------------------------------------------------ teardown
             print("\nTeardown...", flush=True)
-            command("docker", "rm", "--force", sniffer, env=env, check=False)
             require(default_route(env) == route_before, "this computer's default route is unchanged while a VPN session exists")
             bystander = command("docker", "exec", project + "-observer", "python3", "-c",
                                 "import urllib.request,sys; urllib.request.urlopen('http://%s/bystander' % sys.argv[1], timeout=5)",
@@ -863,14 +854,19 @@ def main():
             require(code == 1 and not identities(), "resume with no session starts nothing")
             require((snapshot(*real_state), sorted(p.name for p in (ROOT / ".runtime").glob("vpn/*"))) == real_before,
                     "the real session's credentials, runtime state and VPN store were not touched")
+        except BaseException as error:
+            # Before anything is removed: keep the capture that was running and the fixture's routes and firewall.
+            capture.failed(error)
+            raise
         finally:
             print("Cleaning up VPN integration containers, networks and images...", flush=True)
             cleanup = dict(env, SANDBOX_PASSWORD="validation-only-not-a-session")
-            command("docker", "rm", "--force", project + "-sniff", env=env, check=False)
+            capture.cleanup()
             command(*vpn_compose, "down", "--volumes", "--remove-orphans", timeout=180, check=False, env=cleanup)
             command("docker", "rm", "--force", project + "-vpn", env=env, check=False)
             command("docker", "image", "rm", peer_image, image, env=env, timeout=60, check=False)
         require(default_route(env) == route_before, "this computer's default route is the same after the suite as before it")
+        capture.finish()
     print("VPN integration checks passed.", flush=True)
     return 0
 
