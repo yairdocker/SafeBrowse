@@ -417,7 +417,7 @@ class SecretFileTests(unittest.TestCase):
         (self.root / ".runtime").symlink_to(elsewhere)
         self.assertRaisesRegex(vpn.StorageError, r"^\.runtime is a symbolic link", vpn.stage, self.root, SESSION_ID, self.tunnel)
         (self.root / ".runtime").unlink()
-        (self.root / ".runtime").mkdir()
+        (self.root / ".runtime").mkdir(mode=0o755)
         (self.root / ".runtime/vpn").symlink_to(elsewhere)
         self.assertRaisesRegex(vpn.StorageError, r"^\.runtime/vpn is a symbolic link", vpn.stage, self.root, SESSION_ID, self.tunnel)
         self.assertEqual(list(elsewhere.iterdir()), [])
@@ -569,7 +569,7 @@ class StorageBoundaryTests(unittest.TestCase):
         self.assertEqual(snapshot(self.elsewhere), self.outside)
         (self.root / ".runtime").unlink()
         # 2. .runtime/vpn is a link to existing VPN storage: sessions() said there was none.
-        (self.root / ".runtime").mkdir()
+        (self.root / ".runtime").mkdir(mode=0o755)
         (self.root / ".runtime/vpn").symlink_to(self.elsewhere / ".runtime/vpn")
         self.assertRaises(vpn.StorageError, vpn.sessions, self.root)
         self.assertEqual(snapshot(self.elsewhere), self.outside)
@@ -578,7 +578,7 @@ class StorageBoundaryTests(unittest.TestCase):
         (self.root / ".runtime").symlink_to(self.elsewhere / ".runtime")
         self.assertAllRefuse(r"^\.runtime is a symbolic link")
         (self.root / ".runtime").unlink()
-        (self.root / ".runtime").mkdir()
+        (self.root / ".runtime").mkdir(mode=0o755)
         (self.root / ".runtime/vpn").symlink_to(self.elsewhere / ".runtime/vpn")
         self.assertAllRefuse(r"^\.runtime/vpn is a symbolic link")
         (self.root / ".runtime/vpn").unlink()
@@ -599,7 +599,7 @@ class StorageBoundaryTests(unittest.TestCase):
         self.assertAllRefuse(r"^\.runtime is a symbolic link")
         self.assertFalse(nowhere.exists())                  # nothing was created through the link either
         (self.root / ".runtime").unlink()
-        (self.root / ".runtime").mkdir()
+        (self.root / ".runtime").mkdir(mode=0o755)
         (self.root / ".runtime/vpn").symlink_to(nowhere)
         self.assertAllRefuse(r"^\.runtime/vpn is a symbolic link")
         (self.root / ".runtime/vpn").unlink()
@@ -613,7 +613,7 @@ class StorageBoundaryTests(unittest.TestCase):
         (self.root / ".runtime").write_text("a file")
         self.assertAllRefuse(r"^\.runtime is not a directory")
         (self.root / ".runtime").unlink()
-        (self.root / ".runtime").mkdir()
+        (self.root / ".runtime").mkdir(mode=0o755)
         (self.root / ".runtime/vpn").write_text("a file")
         self.assertAllRefuse(r"^\.runtime/vpn is not a directory")
         (self.root / ".runtime/vpn").unlink()
@@ -713,7 +713,7 @@ class StorageBoundaryTests(unittest.TestCase):
         self.assertEqual(vpn.sessions(self.root), [SESSION_ID])
 
     def test_ordinary_missing_storage_means_no_vpn_session_and_is_not_an_error(self):
-        for prepare in (lambda: None, lambda: (self.root / ".runtime").mkdir(), lambda: (self.root / ".runtime/vpn").mkdir(mode=0o700)):
+        for prepare in (lambda: None, lambda: (self.root / ".runtime").mkdir(mode=0o755), lambda: (self.root / ".runtime/vpn").mkdir(mode=0o700)):
             prepare()
             with self.subTest(present=sorted(snapshot(self.root))):
                 before = snapshot(self.root)
@@ -1306,11 +1306,11 @@ class UnsafeStorageLaunchTests(ModeCase):
         runtime, storage = self.root / ".runtime", self.root / ".runtime/vpn"
         return {
             "runtime is a link": lambda: runtime.symlink_to(self.elsewhere / ".runtime"),
-            "vpn is a link to real storage": lambda: (runtime.mkdir(), storage.symlink_to(self.elsewhere / ".runtime/vpn")),
-            "vpn is a dangling link": lambda: (runtime.mkdir(), storage.symlink_to(self.root / "nowhere")),
-            "vpn is a file": lambda: (runtime.mkdir(), storage.write_text("x")),
-            "vpn is open to others": lambda: (runtime.mkdir(), storage.mkdir(mode=0o755), storage.chmod(0o755)),
-            "session is a link": lambda: (runtime.mkdir(), storage.mkdir(mode=0o700),
+            "vpn is a link to real storage": lambda: (runtime.mkdir(mode=0o755), storage.symlink_to(self.elsewhere / ".runtime/vpn")),
+            "vpn is a dangling link": lambda: (runtime.mkdir(mode=0o755), storage.symlink_to(self.root / "nowhere")),
+            "vpn is a file": lambda: (runtime.mkdir(mode=0o755), storage.write_text("x")),
+            "vpn is open to others": lambda: (runtime.mkdir(mode=0o755), storage.mkdir(mode=0o755), storage.chmod(0o755)),
+            "session is a link": lambda: (runtime.mkdir(mode=0o755), storage.mkdir(mode=0o700),
                                           (storage / SESSION_ID).symlink_to(self.elsewhere / ".runtime/vpn" / SESSION_ID)),
         }
 
@@ -1346,7 +1346,7 @@ class UnsafeStorageLaunchTests(ModeCase):
 
     def test_linked_storage_no_longer_reads_as_a_first_direct_session(self):
         """The reported case: storage with a VPN session in it, reached through a link, started a direct session."""
-        (self.root / ".runtime").mkdir()
+        (self.root / ".runtime").mkdir(mode=0o755)
         (self.root / ".runtime/vpn").symlink_to(self.elsewhere / ".runtime/vpn")
         outcome = self.launch()
         self.assertEqual(outcome.code, 1)

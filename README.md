@@ -14,12 +14,12 @@ The default remains a direct connection.
 No X11, no XQuartz, no GPU passthrough — the container ships a remote desktop
 you open at `https://127.0.0.1:3011/`. Audio works, so video plays with sound.
 
-Built and tested on **macOS + Docker Desktop (Apple Silicon)**. Direct and VPN
-mode also passed the full suite on a GitHub-hosted Ubuntu 24.04 runner.
-**Native Linux remains experimental** until the release checks pass on a stock
-Ubuntu 24.04 installation with rootful Docker. Windows and WSL2 are unsupported.
+Supported on **macOS + Docker Desktop (Apple Silicon)** and on the tested
+**stock Ubuntu 24.04 arm64** configuration with rootful Docker. Direct and VPN
+mode passed on that stock host and on GitHub-hosted Ubuntu 24.04 x86_64.
+Windows and WSL2 are unsupported.
 [Hosted run](https://github.com/yairdocker/SafeBrowse/actions/runs/44850697203) ·
-[Native Linux release gate](LINUX_SECURITY.md#release-gate-for-native-linux)
+[Stock Ubuntu release evidence](LINUX_SECURITY.md#stock-ubuntu-2404-arm64)
 
 Requires **Docker Engine 28+**, Compose v2 and **Python 3.12+** on the host.
 Bash is needed only for the `./*.sh` commands, which are thin wrappers; curl is
@@ -74,8 +74,8 @@ python3 scripts/safebrowse.py run --resume --url https://example.com/
 ```
 
 Either form works from any directory. The launcher has run on macOS with Python
-3.12 and 3.14. The hosted Ubuntu integration suites exercised it with Python
-3.12 in direct and VPN mode.
+3.12 and 3.14. The hosted and stock Ubuntu integration suites exercised it
+with Python 3.12 in direct and VPN mode.
 
 If a session already exists, a plain `./run.sh` refuses to replace or reuse it.
 `--resume` requires all session containers to be running and never rebuilds or
@@ -191,7 +191,7 @@ fingerprinting protection.
 | `cap_drop: ALL` + minimum re-add | Six capabilities instead of the default fourteen. |
 | `no-new-privileges` | No setuid escalation inside the container. |
 | Seccomp profile `security/seccomp-firefox.json` | Docker's default syscall filter plus three calls Firefox's own sandbox needs. Replaces the earlier `seccomp=unconfined`. |
-| AppArmor `docker-default` (Linux hosts with AppArmor) | The browser ran under Docker's default container profile in enforce mode on hosted Ubuntu 24.04. Docker Desktop on the tested Mac does not provide AppArmor. |
+| AppArmor `docker-default` (Linux hosts with AppArmor) | The browser ran under Docker's default container profile in enforce mode on stock arm64 and hosted x86_64 Ubuntu 24.04. Docker Desktop on the tested Mac does not provide AppArmor. |
 | UI bound to `127.0.0.1` | Nothing on your network can reach it. |
 | `mem_limit` / `cpus` / `pids_limit` | A cryptominer hits a ceiling instead of your fans. |
 
@@ -499,11 +499,12 @@ know you don't.
   Linux VM, which is a real boundary — but a kernel exploit chain gets an
   attacker into that VM. This is strong isolation, not a guarantee.
 - **Native Linux shares the host kernel.** A kernel escape would reach the host.
-  Validation on a stock Ubuntu 24.04 installation is still pending.
-  [Linux release gate](LINUX_SECURITY.md#release-gate-for-native-linux)
-- **VPN tests use a controlled WireGuard peer.** They passed on macOS and hosted
-  Ubuntu. Real Mullvad operation remains unverified. Sites see the VPN server's
-  address, and the provider sees the gateway's destinations.
+  Stock Ubuntu arm64 passed the release gate with its default security settings.
+  [Linux release evidence](LINUX_SECURITY.md#stock-ubuntu-2404-arm64)
+- **VPN tests use a controlled WireGuard peer.** They passed on macOS, hosted
+  Ubuntu x86_64 and stock Ubuntu arm64. Real Mullvad operation remains
+  unverified. Sites see the VPN server's address, and the provider sees the
+  gateway's destinations.
   [VPN evidence and limits](VPN_SECURITY.md#observed-results)
 - **The seccomp profile is wider than Docker's default.** It additionally lets
   processes in the browser container create user namespaces with their own

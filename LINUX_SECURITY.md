@@ -6,20 +6,82 @@ configured CI and intended support are kept apart on purpose.
 
 ## Status
 
-**Native Linux remains experimental.** The full suite passed on GitHub-hosted
-Ubuntu 24.04 on 2026-11-21. Native Linux support still requires a run on a
-stock Ubuntu 24.04 installation with its security settings left as installed.
-See the [release gate for native Linux](#release-gate-for-native-linux).
+**Stock Ubuntu 24.04 arm64 passed the native Linux release gate on 2026-11-21.**
+The supported configuration is the rootful Docker installation in the table.
+The x86_64 result comes from GitHub's hosted runner. Stock x86_64 remains unverified.
 Measurements below refer to macOS with Docker Desktop unless a Linux host is named.
 
 | Host | State | Evidence |
 |---|---|---|
 | macOS 26.5 (arm64), Docker Desktop, Engine 29.9.2, Compose 5.6.1, VM kernel 7.0.14-linuxkit, Python 3.12 and 3.14 | Supported; observed | Offline tests and both container suites pass with the configuration described here (2026-11-12). The daemon reports `seccomp` (built-in profile) and no AppArmor. |
-| Stock Ubuntu 24.04, rootful Docker Engine 28+, AppArmor and Ubuntu's user-namespace restriction left on, launched as a non-root user | **Experimental. Release gate pending.** | A qualifying installation still needs the checks listed below. |
+| Stock Ubuntu Server 24.04.5 LTS, arm64, kernel `6.8.0-147-generic`, rootful Docker Engine 29.1.3, Compose 2.40.3 | **Supported on this configuration** | UID 1000, umask `0002`, browser under `docker-default` in enforce mode. `kernel.apparmor_restrict_unprivileged_userns=1`, `kernel.unprivileged_userns_clone=1`. [Stock gate results and baseline](#stock-ubuntu-2404-arm64) |
 | GitHub-hosted `ubuntu-24.04`, Ubuntu 24.04.5 LTS, x86_64, kernel 7.0.0-1017-azure, Docker Engine 28.0.4, Compose 2.38.2 | **Passed on 2026-11-21** | Offline tests on Python 3.12.16 and 3.14.10, both direct-mode suites, the controlled-peer VPN suite and the host baseline passed. [Hosted run](#the-hosted-runner-run) |
 | Other amd64 hosts | **NOT VERIFIED** | The amd64 results come from GitHub's hosted Ubuntu runners. |
 | Rootless Docker; launching as root or with `sudo` | Refused | See *Unsupported configurations*. |
 | Windows, WSL2, other Linux distributions, SELinux hosts | Outside this phase | Not tested. On a Linux daemon without AppArmor the verifier reports an inconclusive result. |
+
+## Stock Ubuntu 24.04 arm64
+
+On 2026-11-21 the full gate ran in a fresh VM booted from Canonical's Ubuntu
+Server 24.04.5 arm64 cloud image (SHA-256
+`50e24e1fb79e89116e939d90aa7738f7af48c442fa1bc2510131e0b39c50348e`).
+Ubuntu supplied the Docker packages. The non-root login used the guest's local
+Unix socket and its default `0002` umask throughout. AppArmor and the
+user-namespace settings retained their installed values.
+
+The tested tree was merge `a5281ef` with the 13 fixture calls in
+`tests/test_launch.py` and `tests/test_vpn.py` requesting mode `0755` for
+`.runtime` (fixture patch SHA-256
+`dba71d59226e6c19f15d9b3c96866e552081b091c1c919f7877a66d65f87bc2a`).
+The suite exercised the production guard against both `0775` and `0777`.
+
+| Check | Stock result |
+|---|---|
+| Required host baseline | Passed before and after the suites with identical output. |
+| Python 3.12.3 offline suite | 392 tests passed. Shell syntax and both Compose configurations also passed. |
+| Direct-mode integration | 58 checks passed, including the outer seccomp filter, enforcing AppArmor profile and Firefox user namespaces. |
+| Launcher lifecycle | 34 checks passed. |
+| Controlled-peer VPN | 162 checks passed. The route-loss capture contained 14 outbound and 19 inbound WireGuard packets and one confirmed inbound IPv6 router solicitation. The firewall DROP counter rose and no new requests reached their destination. The deliberate-leak control rejected all 12 packets. |
+
+<details>
+<summary>Output of <code>python3.12 tests/host_baseline.py --require-linux-baseline</code></summary>
+
+```text
+host.system: Linux
+host.kernel: 6.8.0-147-generic
+host.machine: aarch64
+host.distribution: Ubuntu 24.04.5 LTS
+host.id: ubuntu
+host.version: 24.04
+host.python: 3.12.3
+host.euid: 1000
+endpoint.context: default
+endpoint.transport: unix
+endpoint.socket_present: True
+endpoint.docker_host_set: False
+endpoint.docker_context_set: False
+endpoint.variables_agree: unavailable
+endpoint.resolved: True
+docker.client: 29.1.3
+docker.server: 29.1.3
+docker.os: linux
+docker.arch: arm64
+docker.kernel: 6.8.0-147-generic
+docker.compose: 2.40.3+ds1-0ubuntu1~24.04.1
+docker.system: Ubuntu 24.04.5 LTS
+docker.security: ['name=apparmor', 'name=seccomp,profile=builtin', 'name=cgroupns']
+docker.cgroup: 2
+docker.storage: overlayfs
+settings./proc/sys/kernel/apparmor_restrict_unprivileged_userns: 1
+settings./proc/sys/kernel/apparmor_restrict_unprivileged_unconfined: 0
+settings./proc/sys/kernel/unprivileged_userns_clone: 1
+settings./proc/sys/user/max_user_namespaces: 31388
+settings./sys/module/apparmor/parameters/enabled: Y
+settings./sys/kernel/security/lsm: lockdown,capability,landlock,yama,apparmor
+This host matches the Linux baseline described in LINUX_SECURITY.md.
+```
+
+</details>
 
 ## The hosted-runner run
 
@@ -202,7 +264,7 @@ inconclusive and the message states that the error does not identify the layer.
 
 ## AppArmor and user namespaces on Ubuntu 24.04
 
-The hosted run exercised the browser under Ubuntu's AppArmor restrictions.
+The hosted and stock Ubuntu runs exercised the browser under Ubuntu's AppArmor restrictions.
 
 - Docker generates and loads an AppArmor profile named `docker-default` and
   applies it to containers unless told otherwise. From Engine 29.8 the daemon
@@ -212,10 +274,9 @@ The hosted run exercised the browser under Ubuntu's AppArmor restrictions.
   (`kernel.apparmor_restrict_unprivileged_userns`). The release notes say:
   "This affects all programs on the system that are unprivileged and unconfined."
   A container process under `docker-default` is confined, not unconfined.
-  On the hosted kernel and Engine listed above, UID 1000 successfully ran
+  On both Ubuntu configurations listed above, UID 1000 successfully ran
   `clone(CLONE_NEWUSER)` followed by `unshare(CLONE_NEWPID)` under
-  `docker-default` in enforce mode. The stock-host gate requires the same
-  check with that installation's profile.
+  `docker-default` in enforce mode.
 - Firefox's start-up test includes the `unshare(CLONE_NEWPID)` step specifically
   to detect policies that allow creating a user namespace but nothing useful
   inside it. The verifier makes the same two calls.
@@ -290,8 +351,8 @@ proof of the daemon's identity:
   for Linux) is refused only because its kernel release differs from the host's.
 
 The tests for this check run offline against a simulated CLI. On macOS the
-check correctly refuses. It accepted the hosted Ubuntu runner. The release
-gate below requires a separate observation on stock Ubuntu.
+check correctly refuses. It accepted both the hosted Ubuntu runner and the
+stock arm64 installation.
 
 ## Unsupported configurations
 
@@ -358,14 +419,10 @@ left as installed, and recorded here with the output of
    profile and the user-namespace settings are written into the table at the
    top of this file.
 
-**Gate pending.** GitHub's hosted image passed all listed checks. A stock
-Ubuntu 24.04 installation with its original security settings still needs
-its own run and recorded results.
-
-VPN validation on that stock installation also requires
-`python3 tests/integration_vpn.py` to pass there. The hosted result covers
-the controlled peer on the recorded runner configuration.
-[VPN evidence and remaining validation](VPN_SECURITY.md#on-a-github-hosted-linux-runner)
+**Passed on stock Ubuntu 24.04 arm64 on 2026-11-21.** The same installation
+also passed `python3 tests/integration_vpn.py` against the controlled WireGuard
+peer. Stock amd64 and real Mullvad operation remain unverified.
+[Stock gate results and baseline](#stock-ubuntu-2404-arm64)
 
 ## Sources
 

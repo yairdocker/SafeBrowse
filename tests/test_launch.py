@@ -258,7 +258,7 @@ class LauncherCase(unittest.TestCase):
             shutil.copyfile(ROOT / name, self.root / name)
 
     def runtime_state(self):
-        (self.root / '.runtime').mkdir(exist_ok=True)
+        (self.root / '.runtime').mkdir(mode=0o755, exist_ok=True)
         (self.root / '.runtime/network.json').write_text('{"subnet": "172.31.9.0/24"}\n')
 
     def invoke(self, *argv, environ=None, desktop=None, run=None, euid=1000, **settings):
