@@ -15,11 +15,12 @@ No X11, no XQuartz, no GPU passthrough — the container ships a remote desktop
 you open at `https://127.0.0.1:3011/`. Audio works, so video plays with sound.
 
 Supported on **macOS + Docker Desktop (Apple Silicon)** and on the tested
-**stock Ubuntu 24.04 arm64** configuration with rootful Docker. Direct and VPN
-mode passed on that stock host and on GitHub-hosted Ubuntu 24.04 x86_64.
+**stock Ubuntu 24.04 arm64 and x86_64** configurations with rootful Docker.
+Direct and VPN mode passed on both stock guests and on GitHub-hosted Ubuntu 24.04 x86_64.
 Windows and WSL2 are unsupported.
 [Hosted run](https://github.com/yairdocker/SafeBrowse/actions/runs/44850697203) ·
-[Stock Ubuntu release evidence](LINUX_SECURITY.md#stock-ubuntu-2404-arm64)
+[Stock arm64 gate](LINUX_SECURITY.md#stock-ubuntu-2404-arm64) ·
+[Stock x86_64 gate](LINUX_SECURITY.md#stock-ubuntu-2404-x86_64)
 
 Requires **Docker Engine 28+**, Compose v2 and **Python 3.12+** on the host.
 Bash is needed only for the `./*.sh` commands, which are thin wrappers; curl is
@@ -191,7 +192,7 @@ fingerprinting protection.
 | `cap_drop: ALL` + minimum re-add | Six capabilities instead of the default fourteen. |
 | `no-new-privileges` | No setuid escalation inside the container. |
 | Seccomp profile `security/seccomp-firefox.json` | Docker's default syscall filter plus three calls Firefox's own sandbox needs. Replaces the earlier `seccomp=unconfined`. |
-| AppArmor `docker-default` (Linux hosts with AppArmor) | The browser ran under Docker's default container profile in enforce mode on stock arm64 and hosted x86_64 Ubuntu 24.04. Docker Desktop on the tested Mac does not provide AppArmor. |
+| AppArmor `docker-default` (Linux hosts with AppArmor) | The browser ran under Docker's default container profile in enforce mode on stock Ubuntu 24.04 arm64 and x86_64 and on the hosted x86_64 runner. Docker Desktop on the tested Mac does not provide AppArmor. |
 | UI bound to `127.0.0.1` | Nothing on your network can reach it. |
 | `mem_limit` / `cpus` / `pids_limit` | A cryptominer hits a ceiling instead of your fans. |
 
@@ -454,6 +455,10 @@ the capture check rejected all 11 recorded packets.
 [Hosted run 44850697203](https://github.com/yairdocker/SafeBrowse/actions/runs/44850697203) ·
 [VPN capture evidence](VPN_SECURITY.md#on-a-github-hosted-linux-runner)
 
+In the stock x86_64 gate at `1b6329e`, the route-loss capture recorded 10
+outbound and 15 inbound WireGuard packets. Every outbound packet went to the
+fixture peer. [Stock x86_64 route-loss evidence](VPN_SECURITY.md#on-stock-ubuntu-2404-x86_64)
+
 Run `python3 tests/host_baseline.py` on any host to print the same facts. It
 only reads.
 
@@ -501,10 +506,10 @@ know you don't.
   Linux VM, which is a real boundary — but a kernel exploit chain gets an
   attacker into that VM. This is strong isolation, not a guarantee.
 - **Native Linux shares the host kernel.** A kernel escape would reach the host.
-  Stock Ubuntu arm64 passed the release gate with its default security settings.
-  [Linux release evidence](LINUX_SECURITY.md#stock-ubuntu-2404-arm64)
+  Both stock Ubuntu configurations passed the gate with their default security settings.
+  [Linux release evidence](LINUX_SECURITY.md#release-gate-for-native-linux)
 - **VPN tests use a controlled WireGuard peer.** They passed on macOS, hosted
-  Ubuntu x86_64 and stock Ubuntu arm64. Real Mullvad operation remains
+  Ubuntu x86_64 and stock Ubuntu arm64 and x86_64. Real Mullvad operation remains
   unverified. Sites see the VPN server's address, and the provider sees the
   gateway's destinations.
   [VPN evidence and limits](VPN_SECURITY.md#observed-results)
