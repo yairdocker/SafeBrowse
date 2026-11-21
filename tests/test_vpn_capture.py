@@ -50,6 +50,14 @@ def tar(members):
 # (frame, tcpdump -nn -q line): what the suite accepts...
 OUT_TUNNEL = (frame(OWN, PEER_LINK), f"00:04:10.000001 IP {VPN}.43210 > {PEER}.51820: UDP, length 148")
 IN_TUNNEL = (frame(PEER_LINK, OWN), f"00:04:10.000002 IP {PEER}.51820 > {VPN}.43210: UDP, length 92")
+# One complete Ethernet frame from hosted Ubuntu run 44780762773, including its ICMPv6 checksum.
+RS_PACKET = bytes.fromhex(
+    "333300000002 5265a0cb021b 86dd 60000000 0010 3aff "
+    "fe800000000000005065a0fffecb021b ff020000000000000000000000000002 "
+    "85009496 00000000 01015265a0cb021b")
+RS_LINE = "00:04:11.000007 IP6 fe80::5065:a0ff:fecb:21b > ff02::2: ICMP6, router solicitation, length 16"
+INBOUND_RS = (RS_PACKET, RS_LINE)
+
 # ...and deliberately unmatched records, one of each kind the suite must keep rejecting.
 UNMATCHED = {
     "outbound from the tunnel address": (frame(OWN, OTHER_LINK), f"00:04:11.000003 IP {TUNNEL}.40000 > 203.0.113.10.80: tcp 0"),
@@ -218,7 +226,7 @@ class ReadingTests(unittest.TestCase):
         for order, magic in (("<", 0xa1b2c3d4), (">", 0xa1b2c3d4), ("<", 0xa1b23c4d), (">", 0xa1b23c4d)):
             with self.subTest(order=order, magic=hex(magic)):
                 linktype, found = vpn_capture.frames(pcap(packets, order, magic))
-                self.assertEqual((linktype, len(found), found[0].link, found[1].length), (1, 2, packets[0][:14], 42))
+                self.assertEqual((linktype, len(found), found[0].packet, found[1].length), (1, 2, packets[0], 42))
         self.assertEqual(vpn_capture.frames(pcap([]))[1], [])
         self.assertEqual(vpn_capture.stamp(vpn_capture.frames(pcap(packets))[1][1]), "2026-11-13T00:00:01.001001Z")
 
@@ -314,7 +322,8 @@ class WindowTests(CaptureCase):
         self.assertEqual(self.printed("DIAG"), [])
         self.assertEqual(self.files(), ["01-normal-operation/" + name for name in sorted(vpn_capture.WINDOW_FILES)] + ["run.json"])
         manifest = self.manifest("01-normal-operation")
-        self.assertEqual(manifest["counts"], {"captured_packets": 2, "decoded_lines": 2, "rejected": 0, "rejected_by_direction": {}})
+        self.assertEqual(manifest["counts"], {"captured_packets": 2, "decoded_lines": 2, "inbound_router_solicitations": 0,
+                                               "rejected": 0, "rejected_by_direction": {}})
         self.assertEqual(manifest["status"]["verdict"], "accepted")
         self.assertEqual(manifest["fixture"], {"vpn_address": VPN, "vpn_link_address": OWN, "peer_address": PEER, "wireguard_port": 51820})
         self.assertEqual((self.directory / "01-normal-operation/capture.pcap").read_bytes(), pcap([OUT_TUNNEL[0], IN_TUNNEL[0]]))
@@ -352,25 +361,71 @@ class WindowTests(CaptureCase):
                 self.assertEqual(len(self.printed("DIAG  rejected  ")), 1)
                 self.assertIn(f"evidence: not kept: rerun with {vpn_capture.VARIABLE} set", report)
 
-    def test_inbound_solicitation_can_wait_for_route_loss_but_still_fails_the_run(self):
-        capture = self.capture(Docker({1: [OUT_TUNNEL, UNMATCHED["IPv6"]]}))
-        with self.assertRaisesRegex(RuntimeError, "01-normal-operation"), capture.record():
-            route_loss = capture.check(capture.open("normal operation"), then="route loss", defer_inbound_solicitations=True)
-            capture.check(route_loss)
-            capture.finish()
+    def test_confirmed_inbound_solicitations_are_logged_and_kept_in_the_capture(self):
+        # Two valid eight-byte solicitations omit the link-layer option, with independently calculated checksums.
+        short = RS_PACKET[:18] + bytes.fromhex("0008") + RS_PACKET[20:54] + bytes.fromhex("85008aeb00000000")
+        unspecified = short[:22] + bytes(16) + short[38:54] + bytes.fromhex("85007bb800000000")
+        short_line = RS_LINE.replace("length 16", "length 8")
+        packets = [OUT_TUNNEL, INBOUND_RS, (short, short_line),
+                   (unspecified, short_line.replace("fe80::5065:a0ff:fecb:21b", "::"))]
+        capture = self.capture(Docker({1: packets}))
+        capture.check(capture.open("route loss"))
+        capture.finish()
         run = json.loads((self.directory / "run.json").read_text())
-        self.assertEqual(run["outcome"], "failed")
-        self.assertEqual([w["verdict"] for w in run["windows"]], ["rejected", "accepted"])
+        self.assertEqual((run["outcome"], run["windows"][0]["inbound_router_solicitations"]), ("passed", 3))
+        counts = self.manifest("01-route-loss")["counts"]
+        self.assertEqual((counts["captured_packets"], counts["inbound_router_solicitations"], counts["rejected"]), (4, 3, 0))
+        self.assertTrue(any("solicitation" in line.lower() for line in self.printed("INFO")))
+        folder = self.directory / "01-route-loss"
+        self.assertEqual((folder / "capture.pcap").read_bytes(), pcap([packet for packet, _ in packets]))
+        self.assertIn(RS_LINE, (folder / "decoded.txt").read_text())
+        self.assertNotIn(RS_LINE, (folder / "rejected.txt").read_text())
 
-    def test_other_rejections_and_unmeasured_solicitations_still_stop_immediately(self):
-        inbound = UNMATCHED["IPv6"]
-        outbound = (frame(OWN, "33:33:00:00:00:02", 0x86dd), inbound[1])
-        for packets, settings in (([inbound, outbound], {}), ([inbound], {"no_link_address": True}),
-                                  ([UNMATCHED["inbound to the egress address"]], {}), ([], {})):
-            with self.subTest(packets=packets, settings=settings):
-                capture = self.capture(Docker({1: packets}, **settings), directory=None)
-                with self.assertRaisesRegex(RuntimeError, "on the egress interface"):
-                    capture.check(capture.open("normal operation"), defer_inbound_solicitations=True)
+    def test_solicitations_alone_cannot_prove_tunnel_traffic_or_a_positive_control(self):
+        capture = self.capture(Docker({1: [INBOUND_RS], 2: [INBOUND_RS], 3: [INBOUND_RS]}))
+        with self.assertRaises(RuntimeError):
+            capture.check(capture.open("route loss"))
+        capture.check(capture.open("after restart"), quiet=True)
+        control = capture.close(capture.open("positive control", expect=vpn_capture.DELIBERATE_LEAK))
+        self.assertEqual(control.rejected_lines(), [])
+        self.assertIs(control.as_expected(), False)
+
+    def test_mixed_capture_rejects_every_other_kind_of_traffic(self):
+        records = list(UNMATCHED.values())
+        capture = self.capture(Docker({1: [INBOUND_RS, *records]}))
+        window = capture.open("route loss")
+        with self.assertRaises(RuntimeError):
+            capture.check(window)
+        self.assertEqual(window.rejected_lines(), [line for _, line in records])
+        self.assertEqual(self.manifest("01-route-loss")["counts"]["inbound_router_solicitations"], 1)
+
+    def test_a_solicitation_requires_consistent_measured_direction_headers_and_decode(self):
+        own = bytes.fromhex(OWN.replace(":", ""))
+        malformed = {
+            "outbound": RS_PACKET[:6] + own + RS_PACKET[12:],
+            "multicast source": RS_PACKET[:6] + b"\x53" + RS_PACKET[7:],
+            "wrong destination MAC": own + RS_PACKET[6:],
+            "wrong EtherType": RS_PACKET[:12] + b"\x08\x00" + RS_PACKET[14:],
+            "fragment header": RS_PACKET[:20] + b"\x2c" + RS_PACKET[21:],
+            "wrong hop limit": RS_PACKET[:21] + b"\x40" + RS_PACKET[22:],
+            "another ICMPv6 type": RS_PACKET[:54] + b"\x86" + RS_PACKET[55:],
+            "nonzero code": RS_PACKET[:55] + b"\x01" + RS_PACKET[56:],
+            "bad checksum": RS_PACKET[:56] + b"\0\0" + RS_PACKET[58:],
+            "truncated option": RS_PACKET[:-1],
+            "wrong option MAC": RS_PACKET[:6] + bytes.fromhex("5265a0cb021c") + RS_PACKET[12:],
+        }
+        cases = [(label, (raw, RS_LINE), {}) for label, raw in malformed.items()]
+        cases += [("different decode", (RS_PACKET, RS_LINE.replace("solicitation", "advertisement")), {}),
+                  ("no interface MAC", INBOUND_RS, {"no_link_address": True}),
+                  ("unknown link type", INBOUND_RS, {"capture": pcap([OUT_TUNNEL[0], RS_PACKET], linktype=113),
+                                                    "decoded": f"{OUT_TUNNEL[1]}\n{RS_LINE}\n".encode()})]
+        for label, record, settings in cases:
+            with self.subTest(label=label):
+                capture = self.capture(Docker({1: [OUT_TUNNEL, record]}, **settings), directory=None)
+                window = capture.open("route loss")
+                with self.assertRaises(RuntimeError):
+                    capture.check(window)
+                self.assertEqual(window.rejected_lines(), [record[1]])
 
     def test_a_measured_direction_never_rescues_or_condemns_a_packet(self):
         inbound_leak = UNMATCHED["inbound to the egress address"]
@@ -892,8 +947,8 @@ class SuiteWiringTests(unittest.TestCase):
             self.assertNotIn(removed, self.source)
 
     def test_a_window_is_recording_before_each_fault_is_injected(self):
-        order = ['capture.check(window, then="route loss", defer_inbound_solicitations=True)', '"ip", "route", "del", "default"',
-                 'capture.check(window, then="route restoration")', 'capture.require_expected_verdicts()', '"ip", "route", "add", "default"',
+        order = ['capture.check(window, then="route loss")', '"ip", "route", "del", "default"',
+                 'capture.check(window, then="route restoration")', '"ip", "route", "add", "default"',
                  'capture.check(window, then="interface removal and reconnect")', '"ip", "link", "del"',
                  'capture.check(window, then="peer outage")', '"docker", "stop", "--time", "1", project + "-peer"',
                  'capture.check(window, then="peer recovery")', '"docker", "start", project + "-peer"',

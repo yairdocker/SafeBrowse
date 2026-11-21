@@ -430,10 +430,13 @@ permission to use a private endpoint are fixture settings, set in Python. It
 injects faults (route loss, interface removal, peer outage, container restart,
 stop/start and recreation) from a helper container and records every non-ARP
 packet on the VPN container's egress interface, in a separate capture for each
-scenario. A capture is accepted only if all of it is WireGuard to or from the
-peer. When one is not, the suite prints the rejected packets before it fails,
-and it can keep every capture: see *Capture diagnostics* in
-[VPN_SECURITY.md](VPN_SECURITY.md), which also summarises the results.
+scenario. The suite logs confirmed inbound IPv6 router solicitations separately.
+Every other non-ARP packet must be WireGuard traffic to or from the fixture
+peer. Each ordinary capture window requires tunnel traffic, except for the
+window after restart, which may be quiet. The positive control deliberately
+sends traffic outside the tunnel and checks that the capture rejects it.
+The suite can retain the raw captures and packet summaries. See
+[Capture diagnostics](VPN_SECURITY.md#capture-diagnostics).
 
 GitHub Actions runs the offline tests on `ubuntu-24.04` with Python 3.12 and
 3.14, and the three integration suites with Python 3.12. The integration job

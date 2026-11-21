@@ -243,7 +243,7 @@ def main():
                                   project + "-vpn", env=env).stdout)[project + "_egress"]["IPAddress"]
 
     # Every non-ARP packet on the VPN container's egress interface, one named window per scenario. A window is
-    # accepted only if all of it is WireGuard to or from the peer; see tests/vpn_capture.py.
+    # checked for tunnel traffic, with confirmed inbound router solicitations logged separately.
     capture = vpn_capture.Capture(binary, project, project + "-vpn", peer_image, vpn.EGRESS_INTERFACE, peer_ip,
                                   egress_address, directory=evidence)
 
@@ -583,7 +583,7 @@ def main():
                              f"nslookup -timeout=3 example.com {vpn.DOCKER_RESOLVER} >/dev/null 2>&1; echo $?", env=env)
             require(inside.stdout.strip() != "0", "Docker's resolver inside the VPN namespace cannot be used to resolve "
                                                   "external names outside the tunnel")
-            window = capture.check(window, then="secret handling and resume", defer_inbound_solicitations=True)
+            window = capture.check(window, then="secret handling and resume")
 
             print("\nSecret handling...", flush=True)
             current = generated()
@@ -636,7 +636,7 @@ def main():
             # ------------------------------------------------------------------ tunnel failures in a live namespace
             print("\nFailures inside the running session (fixture-only fault injection)...", flush=True)
             baseline_rules = rules()
-            window = capture.check(window, then="route loss", defer_inbound_solicitations=True)
+            window = capture.check(window, then="route loss")
             command("docker", "exec", "--detach", "--user", "1000:1000", session.browser, "sh", "-c",
                     f"curl --disable --silent --no-buffer --max-time 90 --noproxy '' --proxy http://gateway:3128 "
                     f"http://{WEB}/stream > /tmp/stream.txt 2>/dev/null", env=env)
@@ -659,7 +659,6 @@ def main():
                                         "connection and the new ones, that the kernel sent towards the ordinary route")
             window = capture.check(window, then="route restoration")
             require(rules() == baseline_rules, "route loss: the firewall rules are unchanged")
-            capture.require_expected_verdicts()
             print(f"INFO  established connection had delivered {stream_lines()} chunks; inbound data already in the tunnel "
                   "may still arrive, nothing goes out", flush=True)
             in_namespace("ip", "route", "add", "default", "dev", vpn.TUNNEL_INTERFACE, "table", "51820")

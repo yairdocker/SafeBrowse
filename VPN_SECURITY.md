@@ -465,9 +465,9 @@ Environment: macOS 26.5.2, Apple Silicon, Docker Desktop (Engine 29.9.2, Compose
 generator, image, Compose topology, firewall and verifier as production. Its
 WireGuard server is a container holding keys generated for the run; the
 destinations, including the AdGuard resolver addresses, exist only behind it.
-Packet captures on the VPN container's egress interface, one for each scenario,
-record every non-ARP packet; a capture is accepted only if all of it is
-WireGuard to or from the peer (see [Capture diagnostics](#capture-diagnostics)).
+Each scenario captures non-ARP packets on the VPN container's egress interface.
+The current packet classification rules are under
+[Capture diagnostics](#capture-diagnostics).
 
 | Scenario | Result |
 |---|---|
@@ -535,11 +535,22 @@ fault begins, and the next window is recording before the last one is stopped,
 so no packet falls between two windows. Each is stopped, copied out and decoded
 before its container is removed.
 
-The rule for accepting a window is the one the single capture used: every
-non-ARP packet, in either direction, must be WireGuard between the VPN
-container and the peer, and a window must not be empty unless its scenario is
-expected to be quiet (only *after restart* is). Nothing was added to what is
-accepted. Three things are stricter than before:
+The suite logs and counts confirmed inbound IPv6 router solicitations separately.
+Every other non-ARP packet must be WireGuard traffic between the VPN container
+and its peer. A regular window needs at least one tunnel packet. The *after
+restart* window may be quiet. The positive control requires the observer to
+receive the deliberate request and the capture to reject traffic involving the
+observer's address.
+
+To confirm a solicitation, the suite checks the captured Ethernet frame. Its
+source must be a different unicast MAC from the VPN interface's measured MAC.
+Its Ethernet and IPv6 destinations must be the all-routers multicast addresses
+`33:33:00:00:00:02` and `ff02::2`. The unfragmented IPv6 packet must carry
+ICMPv6 directly, with hop limit 255 and a valid router solicitation header and
+checksum. The 8-byte solicitation carries no options. The 16-byte form carries
+one source link-layer address option that matches the Ethernet source. A
+link-local IPv6 source may use either form. An unspecified source must use the
+8-byte form.
 
 - Secret handling and resume, route restoration and peer recovery are checked
   in windows of their own. Peer recovery was captured before but never checked.
@@ -558,8 +569,9 @@ packets, saying how many more there are. Each packet is shown with its capture
 time, link-layer addresses, tcpdump's one-line summary and a direction. A
 direction is *measured* when the frame's link-layer source was compared with
 the interface's own address, *inferred* when only the fixture's IPv4 addresses
-were available, and otherwise *unknown*. It helps to read a failure and plays no
-part in the verdict. Packet contents are never printed.
+were available, and otherwise *unknown*. Only measured inbound direction can
+qualify a router solicitation for separate logging. Packet contents are never
+printed.
 
 To keep the evidence, name an empty directory outside the checkout:
 

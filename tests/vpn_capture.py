@@ -1,19 +1,18 @@
 """Packet-capture windows for tests/integration_vpn.py. Test-side only: nothing here ships.
 
-The VPN suite proves the kill switch by recording every non-ARP packet on the VPN
-container's egress interface and accepting only WireGuard to or from the fixture
-peer. This module keeps that rule exactly as it was and adds what a failure needs:
+The VPN suite records every non-ARP packet on the VPN container's egress interface.
+It checks for WireGuard traffic to or from the fixture peer and logs confirmed
+inbound IPv6 router solicitations separately. The diagnostics include:
 
 * one capture per scenario ("window"), so a rejected packet belongs to a scenario;
 * the rejected tcpdump lines, each with its capture timestamp and a direction;
 * the raw capture, the decoded and rejected summaries and a manifest, written to
   the directory named by SAFEBROWSE_VPN_DIAGNOSTICS_DIR when that is set.
 
-A direction is diagnostic only. It is "measured" when the frame's link-layer source
+Direction is "measured" when the frame's link-layer source
 is compared with the interface's own address, "inferred" when only the fixture's
-IPv4 addresses are available, and otherwise "unknown". No direction, protocol or
-address is consulted when a window is accepted or rejected: see split() and
-acceptable(), which are the whole of that decision.
+IPv4 addresses are available, and otherwise "unknown". Only measured ingress can
+qualify a router solicitation for the informational log.
 
 A capture that is missing, unreadable, truncated or cannot be decoded raises
 CaptureError. So does one that tcpdump's own closing statistics do not show to
@@ -26,6 +25,7 @@ import contextlib
 import datetime
 import hashlib
 import io
+import ipaddress
 import json
 from pathlib import Path
 import re
@@ -62,7 +62,7 @@ ETHERNET = 1
 MAGIC = {b"\xd4\xc3\xb2\xa1": ("<", 10**6), b"\xa1\xb2\xc3\xd4": (">", 10**6),
          b"\x4d\x3c\xb2\xa1": ("<", 10**9), b"\xa1\xb2\x3c\x4d": (">", 10**9)}
 ADDRESSES = re.compile(r"\bIP (?P<source>\d+\.\d+\.\d+\.\d+)(?:\.\d+)? > (?P<target>\d+\.\d+\.\d+\.\d+)(?:\.\d+)?:")
-Frame = namedtuple("Frame", "seconds fraction unit link length")
+Frame = namedtuple("Frame", "seconds fraction unit packet length")
 Failed = namedtuple("Failed", "returncode stdout stderr")
 
 
@@ -118,7 +118,7 @@ def frames(data):
         offset += 16
         if len(data) - offset < captured:
             raise CaptureError(f"the capture file is truncated inside packet {len(found) + 1}")
-        found.append(Frame(seconds, fraction, unit, data[offset:offset + 14], original))
+        found.append(Frame(seconds, fraction, unit, data[offset:offset + captured], original))
         offset += captured
     return linktype, found
 
@@ -161,9 +161,9 @@ def iso(seconds):
 
 
 def direction(frame, linktype, own, line, vpn_ip):
-    """(direction, basis) of one packet. Diagnostic only: the verdict never looks at it."""
-    if frame is not None and linktype == ETHERNET and own and len(frame.link) >= 12:
-        return ("outbound" if link_address(frame.link[6:12]) == own.lower() else "inbound"), "measured"
+    """(direction, basis) of one packet."""
+    if frame is not None and linktype == ETHERNET and own and len(frame.packet) >= 12:
+        return ("outbound" if link_address(frame.packet[6:12]) == own.lower() else "inbound"), "measured"
     found = ADDRESSES.search(line)
     if found and vpn_ip and found["source"] == vpn_ip:
         return "outbound", "inferred"
@@ -172,19 +172,46 @@ def direction(frame, linktype, own, line, vpn_ip):
     return "unknown", ""
 
 
+def confirmed_inbound_solicitation(frame, linktype, own, line):
+    """Recognise the plain Ethernet all-routers solicitation seen on the hosted bridge."""
+    packet = frame.packet
+    if linktype != ETHERNET or not own or len(packet) != frame.length or len(packet) not in (62, 70):
+        return False
+    source_mac = packet[6:12]
+    if (packet[:6] != bytes.fromhex("333300000002") or source_mac == bytes(6) or source_mac[0] & 1
+            or link_address(source_mac) == own.lower() or packet[12:14] != b"\x86\xdd"):
+        return False
+
+    source = ipaddress.IPv6Address(packet[22:38])
+    target = ipaddress.IPv6Address(packet[38:54])
+    icmp = packet[54:]
+    if (packet[14] >> 4 != 6 or packet[18:22] != struct.pack("!HBB", len(icmp), 58, 255)
+            or not (source.is_link_local or source.is_unspecified) or target != ipaddress.IPv6Address("ff02::2")
+            or icmp[:2] != b"\x85\x00" or any(icmp[4:8])):
+        return False
+    # The optional Ethernet source link-layer address must identify the actual sender.
+    if len(icmp) == 16 and (source.is_unspecified or icmp[8:] != b"\x01\x01" + source_mac):
+        return False
+    if not line.endswith(f" IP6 {source} > ff02::2: ICMP6, router solicitation, length {len(icmp)}"):
+        return False
+    # A valid ICMPv6 checksum folds to all ones over the pseudo-header and message.
+    pseudo_header = packet[22:54] + struct.pack("!I3xB", len(icmp), 58)
+    return sum(word for word, in struct.iter_unpack("!H", pseudo_header + icmp)) % 0xffff == 0
+
+
 def describe(index, frame, linktype, own, line, vpn_ip):
     """One packet: its number, capture time, direction, link-layer addresses and tcpdump's own summary line."""
     where, basis = direction(frame, linktype, own, line, vpn_ip)
     link = "link layer not decoded"
-    if linktype == ETHERNET and len(frame.link) >= 14:
-        link = (f"{link_address(frame.link[6:12])} > {link_address(frame.link[0:6])} "
-                f"ethertype 0x{struct.unpack('!H', frame.link[12:14])[0]:04x}")
+    if linktype == ETHERNET and len(frame.packet) >= 14:
+        link = (f"{link_address(frame.packet[6:12])} > {link_address(frame.packet[0:6])} "
+                f"ethertype 0x{struct.unpack('!H', frame.packet[12:14])[0]:04x}")
     return f"[{index + 1}] {stamp(frame)} {where}{f'[{basis}]' if basis else ''} {link} | {line}"
 
 
 LEGEND = ("direction: [measured] compares each frame's link-layer source with the interface's own address; [inferred] "
           "uses the fixture's IPv4 addresses because no link-layer measurement was available; otherwise unknown. "
-          "It is recorded for diagnosis and never affects the verdict.")
+          "Only a verified router solicitation with measured inbound direction is informational.")
 
 
 def slug(text):
@@ -268,6 +295,7 @@ class Window:
         self.requested = self.recording = self.stopped = None
         self.own = self.vpn_ip = self.pcap = self.linktype = self.problem = self.evidence = None
         self.frames, self.lines, self.rejected, self.summaries, self.files = [], [], [], [], []
+        self.solicitations = []
         self.statistics, self.quiet = {}, False
         self.capture, self.decoding, self.verdict = "not started", "not attempted", "not checked"
 
@@ -349,7 +377,8 @@ class Capture:
         window.quiet = quiet
         try:
             self._collect(window)
-            window.verdict = "accepted" if acceptable(len(window.lines), window.rejected, quiet) else "rejected"
+            eligible = len(window.lines) - len(window.solicitations)
+            window.verdict = "accepted" if acceptable(eligible, window.rejected, quiet) else "rejected"
         except CaptureError as error:
             window.problem = str(error)
             window.verdict = "no verdict: the capture cannot be trusted"
@@ -358,8 +387,8 @@ class Capture:
             self._settle(window)
         return window
 
-    def check(self, window, quiet=False, then=None, *, defer_inbound_solicitations=False):
-        """The suite's assertion: every packet in the window was WireGuard to or from the peer.
+    def check(self, window, quiet=False, then=None):
+        """Check tunnel traffic, accounting separately for confirmed incoming router solicitations.
 
         `then` names the next window. It is opened, and recording, before this one is stopped, so no packet
         falls between two windows.
@@ -368,13 +397,11 @@ class Capture:
         self.close(window, quiet)
         total = len(window.lines)
         message = f"{window.scenario}: all {total} packets on the egress interface were WireGuard to or from the peer"
-        if not acceptable(total, window.rejected, quiet):
-            if defer_inbound_solicitations and window.rejected and not self.export_errors and all(
-                    direction(window.frames[i], window.linktype, window.own, window.lines[i], window.vpn_ip)
-                    == ("inbound", "measured") and " > ff02::2: ICMP6, router solicitation," in window.lines[i]
-                    for i in window.rejected):
-                self.emit(f"FAIL  {window.name}: inbound router solicitation. Continuing to collect route-loss evidence.")
-                return following
+        if window.solicitations:
+            tunnel = total - len(window.solicitations) - len(window.rejected)
+            message = (f"{window.scenario}: {tunnel} WireGuard packets, {len(window.solicitations)} confirmed inbound "
+                       f"router solicitations, {len(window.rejected)} rejected")
+        if window.verdict != "accepted":
             raise RuntimeError(message)
         self.emit(f"PASS  {message}")
         return following
@@ -447,8 +474,11 @@ class Capture:
 
     def _own_address(self, container):
         listed = self._run("docker", "exec", container, "ip", "-o", "link", "show", "dev", self.interface)
-        found = re.search(r"link/ether ([0-9a-fA-F:]{17})", listed.stdout.decode("utf-8", "replace"))
-        return found[1].lower() if listed.returncode == 0 and found else None
+        found = re.search(r"\blink/ether ((?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})\b", listed.stdout.decode("utf-8", "replace"))
+        if listed.returncode or not found:
+            return None
+        address = bytes.fromhex(found[1].replace(":", ""))
+        return link_address(address) if any(address) and not address[0] & 1 else None
 
     def _collect(self, window):
         """Stop tcpdump, copy the capture out, check it is whole and decode it. Fills in the window."""
@@ -518,6 +548,18 @@ class Capture:
                                f"{len(window.frames)} captured packets")
         window.summaries = [describe(index, frame, window.linktype, window.own, line, window.vpn_ip)
                             for index, (frame, line) in enumerate(zip(window.frames, window.lines))]
+        unexpected = []
+        for index in window.rejected:
+            if confirmed_inbound_solicitation(window.frames[index], window.linktype, window.own, window.lines[index]):
+                window.solicitations.append(index)
+                window.summaries[index] += " [confirmed inbound router solicitation]"
+            else:
+                unexpected.append(index)
+        window.rejected = unexpected
+        for index in window.solicitations[:CONSOLE_LIMIT]:
+            self.emit(f"INFO  {window.name}: {shown(window.summaries[index])}")
+        if len(window.solicitations) > CONSOLE_LIMIT:
+            self.emit(f"INFO  {window.name}: {len(window.solicitations) - CONSOLE_LIMIT} additional inbound router solicitations")
         window.decoding = "complete"
 
     def _settle(self, window, announce=False):
@@ -553,6 +595,7 @@ class Capture:
                         "wireguard_port": WIREGUARD_PORT},
             "counts": {"captured_packets": len(window.frames) if window.pcap is not None else None,
                        "decoded_lines": len(window.lines) if window.decoding != "not attempted" else None,
+                       "inbound_router_solicitations": len(window.solicitations) if window.decoding == "complete" else None,
                        "rejected": len(window.rejected) if window.decoding != "not attempted" else None,
                        "rejected_by_direction": directions},
             "tcpdump_statistics": window.statistics,
@@ -626,7 +669,9 @@ class Capture:
                 "note": "outcome 'running' in a finished job means the suite was interrupted; it is not a pass",
                 "windows": [{"window": w.name, "scenario": w.scenario, "expectation": w.expect, "capture": w.capture,
                              "decoding": w.decoding, "verdict": w.verdict, "as_expected": w.as_expected(),
-                             "packets": len(w.frames), "rejected": len(w.rejected)} for w in self.windows],
+                             "packets": len(w.frames), "rejected": len(w.rejected),
+                             "inbound_router_solicitations": len(w.solicitations) if w.decoding == "complete" else None}
+                            for w in self.windows],
                 "failure_state": self.state, "export_errors": self.export_errors}, indent=2) + "\n")
         except (OSError, CaptureError) as error:
             self._export_error(f"{INDEX}: {type(error).__name__}: {error}")
